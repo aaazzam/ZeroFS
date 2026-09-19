@@ -1,4 +1,5 @@
 use crate::checkpoint_manager::CheckpointManager;
+use crate::fork_manager::ForkManager;
 use crate::fs::ZeroFS;
 use crate::fs::errors::FsError;
 use crate::fs::inode::Inode;
@@ -149,6 +150,7 @@ fn trash_sweep_lock() -> Arc<tokio::sync::Mutex<()>> {
 #[derive(Clone)]
 pub struct AdminRpcServer {
     checkpoint_manager: Arc<CheckpointManager>,
+    fork_manager: Arc<ForkManager>,
     fs: Arc<ZeroFS>,
     shutdown: CancellationToken,
 }
@@ -156,11 +158,13 @@ pub struct AdminRpcServer {
 impl AdminRpcServer {
     pub fn new(
         checkpoint_manager: Arc<CheckpointManager>,
+        fork_manager: Arc<ForkManager>,
         fs: Arc<ZeroFS>,
         shutdown: CancellationToken,
     ) -> Self {
         let server = Self {
             checkpoint_manager,
+            fork_manager,
             fs,
             shutdown,
         };
@@ -384,6 +388,43 @@ impl AdminService for AdminRpcServer {
                 name
             ))),
         }
+    }
+
+    async fn create_fork(
+        &self,
+        request: Request<proto::CreateForkRequest>,
+    ) -> Result<Response<proto::CreateForkResponse>, Status> {
+        let request = request.into_inner();
+        let from_checkpoint = if request.from_checkpoint.is_empty() {
+            None
+        } else {
+            Some(request.from_checkpoint)
+        };
+
+        let info = self
+            .fork_manager
+            .create_fork(&request.name, from_checkpoint)
+            .await
+            .map_err(|e| Status::internal(format!("Failed to create fork: {}", e)))?;
+
+        self.success_response(proto::CreateForkResponse {
+            fork: Some(info.into()),
+        })
+    }
+
+    async fn list_forks(
+        &self,
+        _request: Request<proto::ListForksRequest>,
+    ) -> Result<Response<proto::ListForksResponse>, Status> {
+        let forks = self
+            .fork_manager
+            .list_forks()
+            .await
+            .map_err(|e| Status::internal(format!("Failed to list forks: {}", e)))?;
+
+        self.success_response(proto::ListForksResponse {
+            forks: forks.into_iter().map(|f| f.into()).collect(),
+        })
     }
 
     async fn watch_file_access(
@@ -751,13 +792,13 @@ mod tests {
     /// Build an in-memory ZeroFS plus the CheckpointManager the admin server
     /// needs. The slatedb handle is constructed here (instead of via
     /// ZeroFS::new_in_memory) because the CheckpointManager needs it too.
-    async fn make_fs() -> (Arc<ZeroFS>, Arc<CheckpointManager>) {
+    async fn make_fs() -> (Arc<ZeroFS>, Arc<CheckpointManager>, Arc<ForkManager>) {
         make_fs_with_lease(None).await
     }
 
     async fn make_fs_with_lease(
         lease: Option<Arc<crate::replication::Lease>>,
-    ) -> (Arc<ZeroFS>, Arc<CheckpointManager>) {
+    ) -> (Arc<ZeroFS>, Arc<CheckpointManager>, Arc<ForkManager>) {
         let test_key = [0u8; 32];
         let object_store: Arc<dyn slatedb::object_store::ObjectStore> =
             Arc::new(slatedb::object_store::memory::InMemory::new());
@@ -795,12 +836,23 @@ mod tests {
                 )
                 .expect("test key should be lockable"),
                 None,
+                None,
             )
             .await
             .unwrap(),
         );
         fs.start_reclaim_drainer();
-        let checkpoint_manager = Arc::new(CheckpointManager::new(db_handle, db_path, object_store));
+        let checkpoint_manager = Arc::new(CheckpointManager::new(
+            db_handle.clone(),
+            db_path.clone(),
+            Arc::clone(&object_store),
+        ));
+        let fork_manager = Arc::new(ForkManager::new(
+            db_handle.clone(),
+            db_path.clone(),
+            Arc::clone(&object_store),
+            Arc::clone(&checkpoint_manager),
+        ));
         {
             let fc = fs.flush_coordinator.clone();
             checkpoint_manager.set_pre_flush(Arc::new(move || {
@@ -812,17 +864,22 @@ mod tests {
                 })
             }));
         }
-        (fs, checkpoint_manager)
+        (fs, checkpoint_manager, fork_manager)
     }
 
     /// Build an in-memory ZeroFS plus a real admin RPC server on a unix
     /// socket, and connect a real client to it. Mirrors the in-process test
     /// pattern from mount.rs (no mocks).
     async fn setup() -> (Arc<ZeroFS>, RpcClient, CancellationToken, tempfile::TempDir) {
-        let (fs, checkpoint_manager) = make_fs().await;
+        let (fs, checkpoint_manager, fork_manager) = make_fs().await;
 
         let shutdown = CancellationToken::new();
-        let service = AdminRpcServer::new(checkpoint_manager, Arc::clone(&fs), shutdown.clone());
+        let service = AdminRpcServer::new(
+            checkpoint_manager,
+            fork_manager,
+            Arc::clone(&fs),
+            shutdown.clone(),
+        );
 
         let dir = tempfile::tempdir().unwrap();
         let sock = dir.path().join("admin.sock");
@@ -888,9 +945,14 @@ mod tests {
     async fn revocation_filters_admin_success() {
         let lease = crate::replication::Lease::new();
         lease.renew(Duration::from_secs(60));
-        let (fs, checkpoint_manager) = make_fs_with_lease(Some(Arc::clone(&lease))).await;
+        let (fs, checkpoint_manager, fork_manager) = make_fs_with_lease(Some(Arc::clone(&lease))).await;
         let shutdown = CancellationToken::new();
-        let service = AdminRpcServer::new(checkpoint_manager, Arc::clone(&fs), shutdown.clone());
+        let service = AdminRpcServer::new(
+            checkpoint_manager,
+            fork_manager,
+            Arc::clone(&fs),
+            shutdown.clone(),
+        );
 
         // Hold the response at tonic's boundary until authority changes.
         let completed_unary = proto::FlushResponse {};
@@ -1068,7 +1130,7 @@ mod tests {
 
     #[tokio::test]
     async fn startup_sweep_drains_trash_left_by_previous_run() {
-        let (fs, checkpoint_manager) = make_fs().await;
+        let (fs, checkpoint_manager, fork_manager) = make_fs().await;
         let creds = root_creds();
 
         // Simulate a previous run that crashed between RemoveDirectory and
@@ -1087,7 +1149,12 @@ mod tests {
 
         // Constructing the server spawns the startup sweep.
         let shutdown = CancellationToken::new();
-        let _service = AdminRpcServer::new(checkpoint_manager, Arc::clone(&fs), shutdown.clone());
+        let _service = AdminRpcServer::new(
+            checkpoint_manager,
+            fork_manager,
+            Arc::clone(&fs),
+            shutdown.clone(),
+        );
 
         wait_for_trash_drained(&fs).await;
         assert_eq!(

@@ -49,6 +49,7 @@ impl ZeroFS {
             object_store,
             segment_codec,
             None,
+            None,
         )
         .await
     }
@@ -67,11 +68,12 @@ impl ZeroFS {
         dedup: Arc<crate::dedup::DedupCache>,
         // Present only when takeover reconciliation produced an epoch-bound proof.
         lineage_proof: Option<LineageProof>,
-        object_tracer: ObjectTracer,
-        object_store: Arc<dyn slatedb::object_store::ObjectStore>,
-        segment_codec: FrameCodec,
-        seal_threshold_override: Option<usize>,
-    ) -> anyhow::Result<Self> {
+            object_tracer: ObjectTracer,
+            object_store: Arc<dyn slatedb::object_store::ObjectStore>,
+            segment_codec: FrameCodec,
+            seal_threshold_override: Option<usize>,
+            fork_base_epoch: Option<u64>,
+        ) -> anyhow::Result<Self> {
         // The expiry reaper may already be running from CLI setup.
         dedup.start_expiry_reaper();
         let lock_manager = Arc::new(KeyedLockManager::new());
@@ -164,7 +166,13 @@ impl ZeroFS {
         // without keeping its own commit worker alive.
         let (write_coordinator, pending_write_coordinator) =
             WriteCoordinator::channel(next_inode_id);
-        let segment_store = Arc::new(SegmentStore::new(object_store, segment_codec, writer_epoch));
+        let segment_store = SegmentStore::new(object_store, segment_codec, writer_epoch);
+        // Forks own only their base epoch onward; the SegmentPathRouter
+        // underneath resolves older (ancestor) epochs for reads.
+        let segment_store = Arc::new(match fork_base_epoch {
+            Some(base_epoch) => segment_store.with_base_epoch(base_epoch),
+            None => segment_store,
+        });
         let extent_store = ExtentStore::new(
             db.clone(),
             key_codec.clone(),

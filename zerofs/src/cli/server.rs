@@ -220,6 +220,7 @@ async fn start_nbd_servers(
 async fn start_rpc_servers(
     config: Option<&RpcConfig>,
     checkpoint_manager: Arc<CheckpointManager>,
+    fork_manager: Arc<crate::fork_manager::ForkManager>,
     fs: Arc<ZeroFS>,
     shutdown: CancellationToken,
 ) -> Vec<JoinHandle<Result<(), std::io::Error>>> {
@@ -228,7 +229,12 @@ async fn start_rpc_servers(
         None => return Vec::new(),
     };
 
-    let service = crate::rpc::server::AdminRpcServer::new(checkpoint_manager, fs, shutdown.clone());
+    let service = crate::rpc::server::AdminRpcServer::new(
+        checkpoint_manager,
+        fork_manager,
+        fs,
+        shutdown.clone(),
+    );
     let mut handles = Vec::new();
 
     if let Some(addresses) = &config.addresses {
@@ -957,10 +963,19 @@ pub async fn run_server(
         None
     };
 
+    let fork_db_handle = init_result.db_handle.clone();
+    let fork_db_path = init_result.db_path.clone();
+    let fork_object_store = Arc::clone(&init_result.object_store);
     let checkpoint_manager = Arc::new(CheckpointManager::new(
         init_result.db_handle,
         slatedb::object_store::path::Path::from(init_result.db_path),
         init_result.object_store,
+    ));
+    let fork_manager = Arc::new(crate::fork_manager::ForkManager::new(
+        fork_db_handle,
+        slatedb::object_store::path::Path::from(fork_db_path),
+        fork_object_store,
+        Arc::clone(&checkpoint_manager),
     ));
     // Checkpoints must not durably publish a FrameLoc whose segment is still in
     // the RAM open buffer: seal + flush under the barrier first (see
@@ -981,6 +996,7 @@ pub async fn run_server(
     let rpc_handles = start_rpc_servers(
         settings.servers.rpc.as_ref(),
         checkpoint_manager,
+        fork_manager,
         Arc::clone(&fs),
         shutdown.clone(),
     )

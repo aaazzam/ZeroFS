@@ -186,6 +186,19 @@ pub async fn load_wrapped_key_from_object_store(
     }
 }
 
+/// Copy the wrapped key between db paths, e.g. to a fork that must decrypt
+/// its parent's segments and SSTs. The key stays wrapped the whole time.
+pub async fn copy_wrapped_key(
+    object_store: &Arc<dyn ObjectStore>,
+    from_db_path: &Path,
+    to_db_path: &Path,
+) -> Result<()> {
+    let wrapped_key = load_wrapped_key_from_object_store(object_store, from_db_path)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("No wrapped key found at {}", from_db_path))?;
+    save_wrapped_key_to_object_store(object_store, to_db_path, &wrapped_key).await
+}
+
 /// Save wrapped key to object store
 pub async fn save_wrapped_key_to_object_store(
     object_store: &Arc<dyn ObjectStore>,

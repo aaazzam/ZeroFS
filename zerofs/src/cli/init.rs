@@ -51,6 +51,9 @@ struct StartupContext {
     recovering_handoff: bool,
     /// Opening capability retained across writer-open retries.
     opening: Option<crate::replication::leader_record::OpeningToken>,
+    /// Fork lineage when this volume is a fork: routes segment reads across
+    /// ancestors and scopes reclamation to the fork's own epochs.
+    fork_info: Option<crate::fork_info::ForkInfo>,
 }
 
 /// Receiver handles carried through role election and takeover reconciliation.
@@ -177,6 +180,18 @@ impl StartupContext {
 
         info!("Loading or initializing encryption key from object store");
         let db_path = Path::from(actual_db_path.clone());
+        let fork_info = crate::fork_info::ForkInfo::load(&object_store, db_path.as_ref())
+            .await
+            .context("Failed to load fork info")?;
+        if let Some(info) = &fork_info {
+            info!(
+                "Volume is a fork of {} (name: {}, base epoch: {}, ancestors: {})",
+                info.parent_db_path,
+                info.name,
+                info.base_epoch,
+                info.ancestors.len()
+            );
+        }
         let encryption_key = key_management::load_or_init_encryption_key(
             &object_store,
             &db_path,
@@ -236,6 +251,7 @@ impl StartupContext {
             took_over_from_standby: false,
             recovering_handoff: false,
             opening: None,
+            fork_info,
         })
     }
 
@@ -693,9 +709,17 @@ impl StartupContext {
                 self.retrying_object_store.clone(),
                 parts_cache,
             ));
+        // Forks route `segments/` reads across their lineage by writer epoch
+        // (writes/lists stay local); for non-fork volumes this is exactly the
+        // db-path prefixing described above.
         let db_prefix = Path::from(self.actual_db_path.clone());
-        let segment_object_store: Arc<dyn object_store::ObjectStore> =
-            Arc::new(object_store::prefix::PrefixStore::new(prefetch, db_prefix));
+        let segment_object_store: Arc<dyn object_store::ObjectStore> = Arc::new(
+            crate::segment_path_router::SegmentPathRouter::new(
+                prefetch,
+                db_prefix,
+                self.fork_info.as_ref(),
+            ),
+        );
 
         Ok(OpenOutcome::Opened(DbOpen {
             promotion,
@@ -818,6 +842,7 @@ impl ReconciledDb {
             took_over_from_standby: _,
             recovering_handoff: _,
             opening: _,
+            fork_info,
         } = startup;
 
         let serving_writer_epoch = match &slatedb {
@@ -969,6 +994,7 @@ impl ReconciledDb {
             None => None,
         };
         let lease = authority.as_ref().map(|authority| authority.lease());
+        let fork_base_epoch = fork_info.as_ref().map(|info| info.base_epoch);
 
         let sync_writes = settings.lsm.map(|c| c.sync_writes()).unwrap_or(false);
         let ignore_fsync = settings
@@ -998,6 +1024,7 @@ impl ReconciledDb {
             segment_object_store,
             segment_codec,
             None,
+            fork_base_epoch,
         )
         .await
         .context("Failed to initialize filesystem")?;
@@ -1133,6 +1160,7 @@ mod role_decision_tests {
             took_over_from_standby: false,
             recovering_handoff: false,
             opening: None,
+            fork_info: None,
         };
         let election = tokio::spawn(async move {
             startup.become_writer().await?;

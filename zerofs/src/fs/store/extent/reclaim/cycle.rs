@@ -247,6 +247,12 @@ async fn scan_counters(
         let Some((epoch, counter)) = store.key_codec.parse_segcount_key(&key) else {
             continue;
         };
+        // On a fork, cloned segcount rows describe ancestor-owned segments:
+        // leave their lifecycle to the ancestor that wrote them (the read
+        // path still resolves them, see SegmentPathRouter).
+        if epoch < store.segments.base_epoch() {
+            continue;
+        }
         let segid = Segid::new(epoch, counter);
         let Some((live, total)) = KeyCodec::decode_segcount(&value) else {
             error!(

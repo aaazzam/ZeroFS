@@ -13,6 +13,10 @@ service AdminService {
 
     rpc GetCheckpointInfo(GetCheckpointInfoRequest) returns (GetCheckpointInfoResponse);
 
+    rpc CreateFork(CreateForkRequest) returns (CreateForkResponse);
+
+    rpc ListForks(ListForksRequest) returns (ListForksResponse);
+
     rpc WatchFileAccess(WatchFileAccessRequest) returns (stream FileAccessEvent);
 
     rpc WatchObjectAccess(WatchObjectAccessRequest) returns (stream ObjectAccessEvent);
@@ -84,6 +88,33 @@ message GetCheckpointInfoRequest {
 
 message GetCheckpointInfoResponse {
     CheckpointInfo checkpoint = 1;
+}
+
+message ForkInfo {
+    string name = 1;
+    // Object-store db path of the fork; point a [storage] url here and `zerofs run`.
+    string db_path = 2;
+    string parent_db_path = 3;
+    // First writer epoch owned by the fork; older epochs belong to ancestors.
+    uint64 base_epoch = 4;
+    google.protobuf.Timestamp created_at = 5;
+}
+
+message CreateForkRequest {
+    string name = 1;
+    // Named checkpoint to fork from. Empty forks the current durable state
+    // (a fresh checkpoint is created as the branch point).
+    string from_checkpoint = 2;
+}
+
+message CreateForkResponse {
+    ForkInfo fork = 1;
+}
+
+message ListForksRequest {}
+
+message ListForksResponse {
+    repeated ForkInfo forks = 1;
 }
 
 message WatchFileAccessRequest {}

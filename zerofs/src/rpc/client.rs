@@ -152,6 +152,43 @@ impl RpcClient {
         }
     }
 
+    pub async fn create_fork(
+        &self,
+        name: &str,
+        from_checkpoint: Option<String>,
+    ) -> Result<proto::ForkInfo> {
+        let request = proto::CreateForkRequest {
+            name: name.to_string(),
+            from_checkpoint: from_checkpoint.unwrap_or_default(),
+        };
+
+        let response = self
+            .client
+            .clone()
+            .create_fork(request)
+            .await
+            .map_err(|s| anyhow!("{}", s.message()))?
+            .into_inner();
+
+        response
+            .fork
+            .ok_or_else(|| anyhow!("Empty response from server"))
+    }
+
+    pub async fn list_forks(&self) -> Result<Vec<proto::ForkInfo>> {
+        let request = proto::ListForksRequest {};
+
+        let response = self
+            .client
+            .clone()
+            .list_forks(request)
+            .await
+            .map_err(|s| anyhow!("{}", s.message()))?
+            .into_inner();
+
+        Ok(response.forks)
+    }
+
     pub async fn watch_file_access(&self) -> Result<Streaming<proto::FileAccessEvent>> {
         let request = proto::WatchFileAccessRequest {};
 

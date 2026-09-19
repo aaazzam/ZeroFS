@@ -1264,6 +1264,7 @@ mod tests {
             object_store,
             segment_codec,
             None,
+            None,
         )
         .await
         .unwrap();

@@ -75,6 +75,18 @@ pub(crate) async fn run() -> Result<()> {
                 crate::cli::checkpoint::get_checkpoint_info(&config, &name).await?;
             }
         },
+        crate::cli::Commands::Fork { subcommand } => match subcommand {
+            crate::cli::ForkCommands::Create {
+                config,
+                name,
+                from_checkpoint,
+            } => {
+                crate::cli::fork::create_fork(&config, &name, from_checkpoint).await?;
+            }
+            crate::cli::ForkCommands::List { config } => {
+                crate::cli::fork::list_forks(&config).await?;
+            }
+        },
         crate::cli::Commands::Fatrace { config } => {
             crate::cli::fatrace::run_fatrace(config).await?;
         }

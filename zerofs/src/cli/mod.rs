@@ -8,6 +8,7 @@ pub mod checkpoint;
 pub mod debug;
 pub mod fatrace;
 pub mod flush;
+pub mod fork;
 mod init;
 pub mod monitor;
 pub mod otrace;
@@ -61,6 +62,11 @@ pub enum Commands {
     Checkpoint {
         #[command(subcommand)]
         subcommand: CheckpointCommands,
+    },
+    /// Fork management commands: writable clones of this volume
+    Fork {
+        #[command(subcommand)]
+        subcommand: ForkCommands,
     },
     /// Trace file system operations in real-time
     Fatrace {
@@ -166,6 +172,25 @@ pub enum CheckpointCommands {
         config: PathBuf,
         /// Checkpoint name to query
         name: String,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum ForkCommands {
+    /// Create a writable fork of this volume
+    Create {
+        #[arg(short, long)]
+        config: PathBuf,
+        /// Name for the fork (must be unique among this volume's forks)
+        name: String,
+        /// Named checkpoint to fork from; defaults to the current durable state
+        #[arg(long)]
+        from_checkpoint: Option<String>,
+    },
+    /// List this volume's forks
+    List {
+        #[arg(short, long)]
+        config: PathBuf,
     },
 }
 

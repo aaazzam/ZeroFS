@@ -58,6 +58,22 @@ impl From<CheckpointInfo> for proto::CheckpointInfo {
     }
 }
 
+impl From<crate::fork_info::ForkInfo> for proto::ForkInfo {
+    fn from(info: crate::fork_info::ForkInfo) -> Self {
+        let db_path = crate::fork_info::ForkInfo::db_path(&info.parent_db_path, &info.name);
+        proto::ForkInfo {
+            name: info.name,
+            db_path,
+            parent_db_path: info.parent_db_path,
+            base_epoch: info.base_epoch,
+            created_at: Some(Timestamp {
+                seconds: info.created_at as i64,
+                nanos: 0,
+            }),
+        }
+    }
+}
+
 impl TryFrom<proto::CheckpointInfo> for CheckpointInfo {
     type Error = uuid::Error;
 

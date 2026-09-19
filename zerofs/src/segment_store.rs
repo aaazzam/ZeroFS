@@ -67,6 +67,10 @@ pub struct SegmentStore {
     codec: Arc<FrameCodec>,
     epoch: u64,
     counter: AtomicU64,
+    /// Lowest epoch this store owns. Zero on non-fork volumes (owns
+    /// everything); on forks, the fork's base epoch, so reclamation leaves
+    /// ancestor segments alone.
+    base_epoch: u64,
     /// Count of ranged segment GETs issued (a read-amplification metric).
     read_calls: AtomicU64,
 }
@@ -78,8 +82,22 @@ impl SegmentStore {
             codec: Arc::new(codec),
             epoch,
             counter: AtomicU64::new(0),
+            base_epoch: 0,
             read_calls: AtomicU64::new(0),
         }
+    }
+
+    /// Scope ownership to epochs at or above `base_epoch` (see
+    /// [`crate::fork_info::ForkInfo`]): reclamation must not delete or repack
+    /// an ancestor's segments.
+    pub fn with_base_epoch(mut self, base_epoch: u64) -> Self {
+        self.base_epoch = base_epoch;
+        self
+    }
+
+    /// Lowest epoch this store owns (0 on non-fork volumes).
+    pub fn base_epoch(&self) -> u64 {
+        self.base_epoch
     }
 
     /// A shared handle to the frame codec (for the open-segment buffer).

@@ -13,6 +13,7 @@ pub mod replication;
 pub mod retrying_object_store;
 pub mod segment;
 pub mod segment_extractor;
+pub mod segment_path_router;
 pub mod segment_store;
 pub mod storage_class_object_store;
 pub mod task;
@@ -21,6 +22,8 @@ mod app;
 mod bucket_identity;
 mod checkpoint_manager;
 mod cli;
+mod fork_info;
+mod fork_manager;
 mod key_management;
 #[cfg(target_os = "linux")]
 mod mount;
