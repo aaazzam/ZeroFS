@@ -186,6 +186,10 @@ pub enum ForkCommands {
         /// Named checkpoint to fork from; defaults to the current durable state
         #[arg(long)]
         from_checkpoint: Option<String>,
+        /// Point-in-time fork: fork the volume as of the last manifest
+        /// flushed before this RFC 3339 timestamp
+        #[arg(long)]
+        at: Option<String>,
     },
     /// List this volume's forks
     List {

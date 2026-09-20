@@ -105,6 +105,9 @@ message CreateForkRequest {
     // Named checkpoint to fork from. Empty forks the current durable state
     // (a fresh checkpoint is created as the branch point).
     string from_checkpoint = 2;
+    // Point-in-time fork: RFC 3339 timestamp; forks the volume as of the last
+    // manifest flushed before it. Overrides from_checkpoint when set.
+    string at = 3;
 }
 
 message CreateForkResponse {

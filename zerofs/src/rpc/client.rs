@@ -156,10 +156,12 @@ impl RpcClient {
         &self,
         name: &str,
         from_checkpoint: Option<String>,
+        at: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<proto::ForkInfo> {
         let request = proto::CreateForkRequest {
             name: name.to_string(),
             from_checkpoint: from_checkpoint.unwrap_or_default(),
+            at: at.map(|t| t.to_rfc3339()).unwrap_or_default(),
         };
 
         let response = self

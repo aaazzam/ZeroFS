@@ -80,8 +80,9 @@ pub(crate) async fn run() -> Result<()> {
                 config,
                 name,
                 from_checkpoint,
+                at,
             } => {
-                crate::cli::fork::create_fork(&config, &name, from_checkpoint).await?;
+                crate::cli::fork::create_fork(&config, &name, from_checkpoint, at).await?;
             }
             crate::cli::ForkCommands::List { config } => {
                 crate::cli::fork::list_forks(&config).await?;

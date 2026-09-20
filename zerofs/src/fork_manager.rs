@@ -24,9 +24,11 @@ use crate::fork_info::{ForkAncestor, ForkInfo};
 use crate::key_management;
 use anyhow::{Context, Result, anyhow};
 use object_store::{ObjectStore, ObjectStoreExt};
+use chrono::{DateTime, Utc};
 use slatedb::admin::Admin;
 use slatedb::admin::AdminBuilder;
 use slatedb::admin::CloneSourceSpec;
+use slatedb::config::CheckpointOptions;
 use slatedb::object_store::path::Path;
 use std::sync::Arc;
 use uuid::Uuid;
@@ -57,8 +59,16 @@ impl ForkManager {
     }
 
     /// Create a writable fork named `name` from `from_checkpoint` (or from a
-    /// fresh checkpoint of the current durable state when `None`).
-    pub async fn create_fork(&self, name: &str, from_checkpoint: Option<String>) -> Result<ForkInfo> {
+    /// fresh checkpoint of the current durable state when `None`). When `at`
+    /// is given, the fork branches the volume as of the last manifest flushed
+    /// before that timestamp (point-in-time fork); see
+    /// [`ForkManager::manifest_at_time`].
+    pub async fn create_fork(
+        &self,
+        name: &str,
+        from_checkpoint: Option<String>,
+        at: Option<DateTime<Utc>>,
+    ) -> Result<ForkInfo> {
         let name = name.trim();
         validate_fork_name(name)?;
 
@@ -76,41 +86,65 @@ impl ForkManager {
             return Err(anyhow!("A fork named '{}' already exists", name));
         }
 
-        // Resolve the branch point: an existing named checkpoint, or a fresh
-        // one so the fork starts from a consistent durable cut of HEAD. The
-        // fork's first writable open bumps the writer epoch it inherits from
-        // the checkpoint's manifest, so its own segments start one epoch above
-        // that manifest's epoch — which is NOT necessarily the live parent's
-        // current epoch when forking an older checkpoint.
-        let checkpoint = match from_checkpoint.as_deref().map(str::trim) {
+        // Resolve the branch point: an existing named checkpoint, a manifest
+        // chosen by timestamp (point-in-time fork), or a fresh checkpoint of
+        // the current durable state. The fork's first writable open bumps the
+        // writer epoch it inherits from the source manifest, so its own
+        // segments start one epoch above that manifest's epoch — which is NOT
+        // necessarily the live parent's current epoch when forking an older
+        // state.
+        let (checkpoint_id, base_epoch) = if let Some(at) = at {
+            let manifest_id = self.manifest_at_time(at).await?;
+            let result = self
+                .admin
+                .create_detached_checkpoint_at(
+                    manifest_id,
+                    &CheckpointOptions {
+                        lifetime: None,
+                        source: None,
+                        name: Some(format!("pitr-{name}-{}", at.timestamp())),
+                    },
+                )
+                .await
+                .map_err(|e| anyhow!("Failed to pin historical manifest {}: {}", manifest_id, e))?;
+            let manifest = self
+                .admin
+                .read_manifest(Some(manifest_id))
+                .await
+                .map_err(|e| anyhow!("Failed to read historical manifest: {}", e))?
+                .ok_or_else(|| anyhow!("Historical manifest {} not found", manifest_id))?;
+            (result.id, manifest.writer_epoch() + 1)
+        } else {
+            let checkpoint = match from_checkpoint.as_deref().map(str::trim) {
             Some("") | None => {
                 let checkpoint_name = format!("fork-{name}-{}", Uuid::new_v4().simple());
                 self.checkpoint_manager
                     .create_checkpoint(&checkpoint_name)
                     .await?
             }
-            Some(checkpoint_name) => self
-                .checkpoint_manager
-                .get_checkpoint_info(checkpoint_name)
-                .await?
-                .ok_or_else(|| anyhow!("Checkpoint '{}' not found", checkpoint_name))?,
+                Some(checkpoint_name) => self
+                    .checkpoint_manager
+                    .get_checkpoint_info(checkpoint_name)
+                    .await?
+                    .ok_or_else(|| anyhow!("Checkpoint '{}' not found", checkpoint_name))?,
+            };
+            let checkpoints = self
+                .admin
+                .list_checkpoints(None)
+                .await
+                .map_err(|e| anyhow!("Failed to list checkpoints: {}", e))?;
+            let source = checkpoints
+                .into_iter()
+                .find(|cp| cp.id == checkpoint.id)
+                .ok_or_else(|| anyhow!("Checkpoint '{}' no longer exists", checkpoint.name))?;
+            let source_manifest = self
+                .admin
+                .read_manifest(Some(source.manifest_id))
+                .await
+                .map_err(|e| anyhow!("Failed to read checkpoint manifest: {}", e))?
+                .ok_or_else(|| anyhow!("Checkpoint manifest not found"))?;
+            (checkpoint.id, source_manifest.writer_epoch() + 1)
         };
-        let checkpoints = self
-            .admin
-            .list_checkpoints(None)
-            .await
-            .map_err(|e| anyhow!("Failed to list checkpoints: {}", e))?;
-        let source = checkpoints
-            .into_iter()
-            .find(|cp| cp.id == checkpoint.id)
-            .ok_or_else(|| anyhow!("Checkpoint '{}' no longer exists", checkpoint.name))?;
-        let source_manifest = self
-            .admin
-            .read_manifest(Some(source.manifest_id))
-            .await
-            .map_err(|e| anyhow!("Failed to read checkpoint manifest: {}", e))?
-            .ok_or_else(|| anyhow!("Checkpoint manifest not found"))?;
-        let base_epoch = source_manifest.writer_epoch() + 1;
 
         let parent_info =
             ForkInfo::load(&self.object_store, self.parent_db_path.as_ref()).await?;
@@ -133,7 +167,7 @@ impl ForkManager {
         admin
             .create_clone_builder_from_source(CloneSourceSpec::with_checkpoint(
                 self.parent_db_path.clone(),
-                checkpoint.id,
+                checkpoint_id,
             ))
             .build()
             .await
@@ -163,6 +197,40 @@ impl ForkManager {
         Ok(info)
     }
 
+    /// The id of the last manifest flushed at or before `target`.
+    ///
+    /// Manifests are immutable, monotonically numbered objects under
+    /// `<db path>/manifest/`, each stamped with the object store's
+    /// last-modified time (the flush publication time), so a timestamp maps
+    /// to a point in the volume's history without any extra bookkeeping.
+    pub async fn manifest_at_time(&self, target: DateTime<Utc>) -> Result<u64> {
+        let prefix = Path::from(format!("{}/manifest", self.parent_db_path));
+        let mut stream = self.object_store.list(Some(&prefix));
+        let mut best: Option<(u64, DateTime<Utc>)> = None;
+        {
+            use futures::TryStreamExt;
+            while let Some(meta) = stream.try_next().await? {
+                let Some(id) = parse_manifest_id(&meta.location) else {
+                    continue;
+                };
+                let last_modified: DateTime<Utc> = meta.last_modified.into();
+                if last_modified > target {
+                    continue;
+                }
+                if best.is_none_or(|(best_id, _)| id > best_id) {
+                    best = Some((id, last_modified));
+                }
+            }
+        }
+        best.map(|(id, _)| id).ok_or_else(|| {
+            anyhow!(
+                "No manifest on '{}' at or before {}",
+                self.parent_db_path,
+                target
+            )
+        })
+    }
+
     /// List the direct forks of this volume.
     pub async fn list_forks(&self) -> Result<Vec<ForkInfo>> {
         let prefix = Path::from(format!("{}/{}", self.parent_db_path, crate::fork_info::FORKS_INFIX));
@@ -189,6 +257,13 @@ impl ForkManager {
         forks.sort_by(|a, b| a.created_at.cmp(&b.created_at).then(a.name.cmp(&b.name)));
         Ok(forks)
     }
+}
+
+/// The manifest sequence id in a `<db path>/manifest/<id>.manifest` key.
+fn parse_manifest_id(location: &Path) -> Option<u64> {
+    let filename = location.filename()?;
+    let id = filename.strip_suffix(".manifest")?;
+    id.parse().ok()
 }
 
 fn validate_fork_name(name: &str) -> Result<()> {
@@ -373,7 +448,7 @@ mod tests {
             .await
             .unwrap();
 
-        let info = fork_manager.create_fork("f1", None).await.unwrap();
+        let info = fork_manager.create_fork("f1", None, None).await.unwrap();
         assert_eq!(info.base_epoch, 2, "fork starts one epoch above the parent");
         assert_eq!(info.ancestors.len(), 1);
 
@@ -447,7 +522,7 @@ mod tests {
             .unwrap();
 
         // Fork f1 and write into it.
-        fork_manager.create_fork("f1", None).await.unwrap();
+        fork_manager.create_fork("f1", None, None).await.unwrap();
         let f1_info = ForkInfo::load(&object_store, "vol/forks/f1")
             .await
             .unwrap()
@@ -474,7 +549,7 @@ mod tests {
             Arc::clone(&object_store),
             &f1_fs,
         );
-        let g_info = g_manager.create_fork("g", None).await.unwrap();
+        let g_info = g_manager.create_fork("g", None, None).await.unwrap();
         assert_eq!(g_info.base_epoch, 3);
         assert_eq!(g_info.ancestors.len(), 2);
 
@@ -557,7 +632,7 @@ mod tests {
             &parent_fs,
         );
         let info = fork_manager
-            .create_fork("past", Some("old".to_string()))
+            .create_fork("past", Some("old".to_string()), None)
             .await
             .unwrap();
         assert_eq!(
@@ -598,5 +673,85 @@ mod tests {
             parent_fs.lookup(&creds, 0, b"c.txt").await,
             Err(FsError::NotFound)
         ));
+    }
+
+    /// A point-in-time fork: --at resolves the last manifest flushed before
+    /// the timestamp and branches exactly that state.
+    #[tokio::test]
+    async fn fork_at_timestamp_branches_the_state_at_that_time() {
+        let (parent_fs, fork_manager, object_store, parent_path, _parent_db) =
+            new_parent_volume().await;
+        let creds = test_creds();
+        let auth = root_auth();
+
+        // State A, flushed to a manifest.
+        let (file_a, _) = parent_fs
+            .create(&creds, 0, b"a.txt", &SetAttributes::default())
+            .await
+            .unwrap();
+        parent_fs
+            .write(&auth, file_a, 0, &Bytes::from_static(b"state A"))
+            .await
+            .unwrap();
+        let (checkpoint_manager, _) = managers(
+            _parent_db.clone(),
+            parent_path.clone(),
+            Arc::clone(&object_store),
+            &parent_fs,
+        );
+        checkpoint_manager.create_checkpoint("a").await.unwrap();
+
+        // The branch point: the newest manifest on the store right now.
+        let target = {
+            use futures::TryStreamExt;
+            let prefix = slatedb::object_store::path::Path::from("vol/manifest");
+            let mut stream = object_store.list(Some(&prefix));
+            let mut newest: Option<chrono::DateTime<chrono::Utc>> = None;
+            while let Some(meta) = stream.try_next().await.unwrap() {
+                let lm: chrono::DateTime<chrono::Utc> = meta.last_modified.into();
+                if newest.is_none_or(|n| lm > n) {
+                    newest = Some(lm);
+                }
+            }
+            newest.expect("a manifest exists")
+        };
+
+        // State B, written after the branch point.
+        let (file_b, _) = parent_fs
+            .create(&creds, 0, b"b.txt", &SetAttributes::default())
+            .await
+            .unwrap();
+        parent_fs
+            .write(&auth, file_b, 0, &Bytes::from_static(b"state B"))
+            .await
+            .unwrap();
+        parent_fs.flush_coordinator.flush().await.unwrap();
+
+        let info = fork_manager
+            .create_fork("pit", None, Some(target))
+            .await
+            .unwrap();
+        let fork_info = ForkInfo::load(&object_store, "vol/forks/pit")
+            .await
+            .unwrap()
+            .unwrap();
+        let (fork_fs, _fork_db) = open_volume(
+            Arc::clone(&object_store),
+            Path::from("vol/forks/pit"),
+            Some(fork_info),
+        )
+        .await;
+
+        let (data, _) = fork_fs.read_file(&auth, file_a, 0, 1024).await.unwrap();
+        assert_eq!(&data[..], b"state A", "fork sees the state at the timestamp");
+        assert!(matches!(
+            fork_fs.lookup(&creds, 0, b"b.txt").await,
+            Err(FsError::NotFound)
+        ));
+        assert_eq!(info.base_epoch, 2);
+        assert!(fork_manager
+            .create_fork("too-early", None, Some(chrono::DateTime::UNIX_EPOCH))
+            .await
+            .is_err());
     }
 }

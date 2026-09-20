@@ -3,9 +3,21 @@ use anyhow::Result;
 use comfy_table::{Table, presets::UTF8_FULL};
 use std::path::Path;
 
-pub async fn create_fork(config_path: &Path, name: &str, from_checkpoint: Option<String>) -> Result<()> {
+pub async fn create_fork(
+    config_path: &Path,
+    name: &str,
+    from_checkpoint: Option<String>,
+    at: Option<String>,
+) -> Result<()> {
+    let at = at
+        .map(|t| {
+            chrono::DateTime::parse_from_rfc3339(&t)
+                .map(|t| t.to_utc())
+                .map_err(|e| anyhow::anyhow!("invalid --at timestamp '{t}': {e}"))
+        })
+        .transpose()?;
     let client = connect_rpc_client(config_path).await?;
-    let fork = client.create_fork(name, from_checkpoint).await?;
+    let fork = client.create_fork(name, from_checkpoint, at).await?;
 
     println!("✓ Fork created successfully!");
     println!("  Name: {}", fork.name);

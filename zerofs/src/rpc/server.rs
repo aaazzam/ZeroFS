@@ -400,10 +400,19 @@ impl AdminService for AdminRpcServer {
         } else {
             Some(request.from_checkpoint)
         };
+        let at = if request.at.is_empty() {
+            None
+        } else {
+            Some(
+                chrono::DateTime::parse_from_rfc3339(&request.at)
+                    .map_err(|e| Status::invalid_argument(format!("invalid --at timestamp: {e}")))?
+                    .to_utc(),
+            )
+        };
 
         let info = self
             .fork_manager
-            .create_fork(&request.name, from_checkpoint)
+            .create_fork(&request.name, from_checkpoint, at)
             .await
             .map_err(|e| Status::internal(format!("Failed to create fork: {}", e)))?;
 
