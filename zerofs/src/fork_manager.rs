@@ -24,6 +24,7 @@ use crate::fork_info::{ForkAncestor, ForkInfo};
 use crate::key_management;
 use anyhow::{Context, Result, anyhow};
 use object_store::{ObjectStore, ObjectStoreExt};
+use slatedb::admin::Admin;
 use slatedb::admin::AdminBuilder;
 use slatedb::admin::CloneSourceSpec;
 use slatedb::object_store::path::Path;
@@ -35,6 +36,7 @@ pub struct ForkManager {
     parent_db_path: Path,
     object_store: Arc<dyn ObjectStore>,
     checkpoint_manager: Arc<CheckpointManager>,
+    admin: Admin,
 }
 
 impl ForkManager {
@@ -44,11 +46,13 @@ impl ForkManager {
         object_store: Arc<dyn ObjectStore>,
         checkpoint_manager: Arc<CheckpointManager>,
     ) -> Self {
+        let admin = AdminBuilder::new(parent_db_path.clone(), Arc::clone(&object_store)).build();
         Self {
             db_handle,
             parent_db_path,
             object_store,
             checkpoint_manager,
+            admin,
         }
     }
 
@@ -58,14 +62,11 @@ impl ForkManager {
         let name = name.trim();
         validate_fork_name(name)?;
 
-        let db = match &self.db_handle {
-            SlateDbHandle::ReadWrite(db) => db,
-            SlateDbHandle::ReadOnly(_) => {
-                return Err(anyhow!(
-                    "Cannot create forks in read-only mode. Start the server without --read-only or --checkpoint flags."
-                ));
-            }
-        };
+        if matches!(&self.db_handle, SlateDbHandle::ReadOnly(_)) {
+            return Err(anyhow!(
+                "Cannot create forks in read-only mode. Start the server without --read-only or --checkpoint flags."
+            ));
+        }
 
         let fork_db_path = ForkInfo::db_path(self.parent_db_path.as_ref(), name);
         if ForkInfo::load(&self.object_store, &fork_db_path)
@@ -76,7 +77,11 @@ impl ForkManager {
         }
 
         // Resolve the branch point: an existing named checkpoint, or a fresh
-        // one so the fork starts from a consistent durable cut of HEAD.
+        // one so the fork starts from a consistent durable cut of HEAD. The
+        // fork's first writable open bumps the writer epoch it inherits from
+        // the checkpoint's manifest, so its own segments start one epoch above
+        // that manifest's epoch — which is NOT necessarily the live parent's
+        // current epoch when forking an older checkpoint.
         let checkpoint = match from_checkpoint.as_deref().map(str::trim) {
             Some("") | None => {
                 let checkpoint_name = format!("fork-{name}-{}", Uuid::new_v4().simple());
@@ -90,16 +95,22 @@ impl ForkManager {
                 .await?
                 .ok_or_else(|| anyhow!("Checkpoint '{}' not found", checkpoint_name))?,
         };
-
-        // The fork's first writable open bumps the clone's writer epoch (the
-        // clone inherits the parent's), so its own segments start one epoch
-        // above the parent's current epoch.
-        let parent_writer_epoch = db
-            .subscribe()
-            .borrow()
-            .current_manifest
-            .writer_epoch();
-        let base_epoch = parent_writer_epoch + 1;
+        let checkpoints = self
+            .admin
+            .list_checkpoints(None)
+            .await
+            .map_err(|e| anyhow!("Failed to list checkpoints: {}", e))?;
+        let source = checkpoints
+            .into_iter()
+            .find(|cp| cp.id == checkpoint.id)
+            .ok_or_else(|| anyhow!("Checkpoint '{}' no longer exists", checkpoint.name))?;
+        let source_manifest = self
+            .admin
+            .read_manifest(Some(source.manifest_id))
+            .await
+            .map_err(|e| anyhow!("Failed to read checkpoint manifest: {}", e))?
+            .ok_or_else(|| anyhow!("Checkpoint manifest not found"))?;
+        let base_epoch = source_manifest.writer_epoch() + 1;
 
         let parent_info =
             ForkInfo::load(&self.object_store, self.parent_db_path.as_ref()).await?;
@@ -482,5 +493,110 @@ mod tests {
         assert_eq!(&data[..], b"base", "g reads the root volume's file");
         let (data, _) = g_fs.read_file(&auth, f1_file_id, 0, 1024).await.unwrap();
         assert_eq!(&data[..], b"f1 write", "g reads its parent fork's file");
+    }
+
+    /// Forking an OLD checkpoint must compute the fork's base epoch from the
+    /// checkpoint's manifest, not from the live parent's current epoch: the
+    /// clone inherits the checkpoint-era epoch, so its own segments start one
+    /// above that, and the router must agree.
+    #[tokio::test]
+    async fn fork_from_old_checkpoint_routes_own_writes() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let db_path = Path::from("vol");
+        key_management::load_or_init_encryption_key(
+            &object_store,
+            &db_path,
+            crate::secrets::EncryptionPassword::try_new(TEST_PASSWORD).unwrap(),
+            false,
+        )
+        .await
+        .unwrap();
+        let creds = test_creds();
+        let auth = root_auth();
+
+        // Parent, first open (writer epoch 1): write file A, checkpoint it.
+        let (parent_fs, parent_db) =
+            open_volume(Arc::clone(&object_store), db_path.clone(), None).await;
+        let (file_a, _) = parent_fs
+            .create(&creds, 0, b"a.txt", &SetAttributes::default())
+            .await
+            .unwrap();
+        parent_fs
+            .write(&auth, file_a, 0, &Bytes::from_static(b"old state"))
+            .await
+            .unwrap();
+        let (checkpoint_manager, _) = managers(
+            parent_db.clone(),
+            db_path.clone(),
+            Arc::clone(&object_store),
+            &parent_fs,
+        );
+        checkpoint_manager.create_checkpoint("old").await.unwrap();
+        if let SlateDbHandle::ReadWrite(db) = &parent_db {
+            db.close().await.unwrap();
+        }
+
+        // Parent restarts (writer epoch bumps to 2) and writes file B.
+        let (parent_fs, parent_db) =
+            open_volume(Arc::clone(&object_store), db_path.clone(), None).await;
+        let (file_b, _) = parent_fs
+            .create(&creds, 0, b"b.txt", &SetAttributes::default())
+            .await
+            .unwrap();
+        parent_fs
+            .write(&auth, file_b, 0, &Bytes::from_static(b"new state"))
+            .await
+            .unwrap();
+
+        // Fork from the OLD checkpoint: base epoch must come from the
+        // checkpoint's manifest (1), not the live parent's epoch (2).
+        let (_, fork_manager) = managers(
+            parent_db.clone(),
+            db_path.clone(),
+            Arc::clone(&object_store),
+            &parent_fs,
+        );
+        let info = fork_manager
+            .create_fork("past", Some("old".to_string()))
+            .await
+            .unwrap();
+        assert_eq!(
+            info.base_epoch, 2,
+            "fork of an epoch-1 checkpoint owns epoch 2 onward"
+        );
+
+        // The fork sees the old state, not file B, and its own writes at
+        // epoch 2 route to itself (not to the parent).
+        let fork_info = ForkInfo::load(&object_store, "vol/forks/past")
+            .await
+            .unwrap()
+            .unwrap();
+        let (fork_fs, _fork_db) = open_volume(
+            Arc::clone(&object_store),
+            Path::from("vol/forks/past"),
+            Some(fork_info),
+        )
+        .await;
+        let (data, _) = fork_fs.read_file(&auth, file_a, 0, 1024).await.unwrap();
+        assert_eq!(&data[..], b"old state");
+        assert!(matches!(
+            fork_fs.lookup(&creds, 0, b"b.txt").await,
+            Err(FsError::NotFound)
+        ));
+
+        let (file_c, _) = fork_fs
+            .create(&creds, 0, b"c.txt", &SetAttributes::default())
+            .await
+            .unwrap();
+        fork_fs
+            .write(&auth, file_c, 0, &Bytes::from_static(b"fork write"))
+            .await
+            .unwrap();
+        let (data, _) = fork_fs.read_file(&auth, file_c, 0, 1024).await.unwrap();
+        assert_eq!(&data[..], b"fork write", "fork reads back its own writes");
+        assert!(matches!(
+            parent_fs.lookup(&creds, 0, b"c.txt").await,
+            Err(FsError::NotFound)
+        ));
     }
 }
