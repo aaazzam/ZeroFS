@@ -191,6 +191,13 @@ pub enum ForkCommands {
         #[arg(long)]
         at: Option<String>,
     },
+    /// Delete a fork, releasing its pin on the parent's reclamation
+    Delete {
+        #[arg(short, long)]
+        config: PathBuf,
+        /// Fork name to delete
+        name: String,
+    },
     /// List this volume's forks
     List {
         #[arg(short, long)]

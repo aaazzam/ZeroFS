@@ -17,6 +17,8 @@ service AdminService {
 
     rpc ListForks(ListForksRequest) returns (ListForksResponse);
 
+    rpc DeleteFork(DeleteForkRequest) returns (DeleteForkResponse);
+
     rpc WatchFileAccess(WatchFileAccessRequest) returns (stream FileAccessEvent);
 
     rpc WatchObjectAccess(WatchObjectAccessRequest) returns (stream ObjectAccessEvent);
@@ -119,6 +121,12 @@ message ListForksRequest {}
 message ListForksResponse {
     repeated ForkInfo forks = 1;
 }
+
+message DeleteForkRequest {
+    string name = 1;
+}
+
+message DeleteForkResponse {}
 
 message WatchFileAccessRequest {}
 

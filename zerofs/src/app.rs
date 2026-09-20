@@ -87,6 +87,9 @@ pub(crate) async fn run() -> Result<()> {
             crate::cli::ForkCommands::List { config } => {
                 crate::cli::fork::list_forks(&config).await?;
             }
+            crate::cli::ForkCommands::Delete { config, name } => {
+                crate::cli::fork::delete_fork(&config, &name).await?;
+            }
         },
         crate::cli::Commands::Fatrace { config } => {
             crate::cli::fatrace::run_fatrace(config).await?;

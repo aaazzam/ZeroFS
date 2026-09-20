@@ -191,6 +191,20 @@ impl RpcClient {
         Ok(response.forks)
     }
 
+    pub async fn delete_fork(&self, name: &str) -> Result<()> {
+        let request = proto::DeleteForkRequest {
+            name: name.to_string(),
+        };
+
+        self.client
+            .clone()
+            .delete_fork(request)
+            .await
+            .map_err(|s| anyhow!("{}", s.message()))?;
+
+        Ok(())
+    }
+
     pub async fn watch_file_access(&self) -> Result<Streaming<proto::FileAccessEvent>> {
         let request = proto::WatchFileAccessRequest {};
 

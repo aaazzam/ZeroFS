@@ -436,6 +436,20 @@ impl AdminService for AdminRpcServer {
         })
     }
 
+    async fn delete_fork(
+        &self,
+        request: Request<proto::DeleteForkRequest>,
+    ) -> Result<Response<proto::DeleteForkResponse>, Status> {
+        let name = request.into_inner().name;
+
+        self.fork_manager
+            .delete_fork(&name)
+            .await
+            .map_err(|e| Status::internal(format!("Failed to delete fork: {}", e)))?;
+
+        self.success_response(proto::DeleteForkResponse {})
+    }
+
     async fn watch_file_access(
         &self,
         _request: Request<proto::WatchFileAccessRequest>,

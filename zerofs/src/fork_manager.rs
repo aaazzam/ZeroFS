@@ -403,6 +403,126 @@ impl ForkManager {
         Ok(forks)
     }
 
+    /// Delete the fork named `name`: release the GC pin it holds on this
+    /// volume's manifest, remove every object under the fork's db path, and
+    /// drop its registry entry from this volume's LSM.
+    ///
+    /// **Stop the fork's server first.** SlateDB fencing is single-writer:
+    /// a fork server still running against the fork's db path would
+    /// re-fence the delete's manifest reads and could recreate state
+    /// (flushed manifests, new checkpoints) under a half-deleted prefix.
+    ///
+    /// A fork that has forks of its own is refused until those children
+    /// are deleted: their external SST references point at this fork's db
+    /// path, so deleting it would orphan them.
+    ///
+    /// Deleting a fork never affects its parent or siblings: the fork's
+    /// external SSTs stay at the parent's path untouched, and every object
+    /// delete is scoped to the fork's own db path (`<parent>/forks/<name>`
+    /// — object-store prefix listings match on a path-segment basis, so a
+    /// sibling like `forks/<name>2` is never in scope).
+    pub async fn delete_fork(&self, name: &str) -> Result<()> {
+        use futures::TryStreamExt;
+
+        let name = name.trim();
+        validate_fork_name(name)?;
+
+        let SlateDbHandle::ReadWrite(parent_db) = &self.db_handle else {
+            return Err(anyhow!(
+                "Cannot delete forks in read-only mode. Start the server without --read-only or --checkpoint flags."
+            ));
+        };
+
+        let codec = KeyCodec::new();
+        let registry_key = codec.fork_registry_key(name);
+        if self
+            .registry_value(parent_db, &registry_key)
+            .await?
+            .is_none()
+        {
+            return Err(anyhow!("Fork '{}' not found", name));
+        }
+
+        let fork_db_path = Path::from(ForkInfo::db_path(self.parent_db_path.as_ref(), name));
+
+        // Refuse while children anchor on this fork. Their slatedb clones
+        // exist under `<fork db path>/forks/` from the moment of creation
+        // (before the registry write), so a prefix listing catches orphans
+        // a registry scan would miss.
+        let children_prefix = Path::from(format!("{fork_db_path}/{FORKS_INFIX}"));
+        let mut children = self.object_store.list(Some(&children_prefix));
+        if children.try_next().await?.is_some() {
+            return Err(anyhow!(
+                "Fork '{}' has forks of its own; delete its forks first",
+                name
+            ));
+        }
+
+        let fork_admin =
+            AdminBuilder::new(fork_db_path.clone(), Arc::clone(&self.object_store)).build();
+
+        // Release the GC pin: the clone pinned an unnamed checkpoint on
+        // this volume's manifest, recorded in the fork's own manifest as
+        // this parent's `external_dbs` entry (`final_checkpoint_id`). While
+        // it exists, the parent's segment reclamation pauses (any
+        // persistent checkpoint protects segments indefinitely), so this is
+        // what resumes it. A fork too corrupt to read has effectively lost
+        // its pin record; warn and proceed (slatedb's delete_db below
+        // strips the pin itself when it can read the manifest).
+        match fork_admin.read_manifest(None).await {
+            Ok(Some(manifest)) => {
+                for external_db in manifest.external_dbs() {
+                    if external_db.path != self.parent_db_path.as_ref() {
+                        continue;
+                    }
+                    if let Some(pin) = external_db.final_checkpoint_id {
+                        self.admin.delete_checkpoint(pin).await.map_err(|e| {
+                            anyhow!("Failed to release fork '{}'s pin on the parent: {}", name, e)
+                        })?;
+                    }
+                }
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!(
+                    "Could not read fork '{}'s manifest to release its pin ({}); proceeding",
+                    name,
+                    e
+                );
+            }
+        }
+
+        // Delete the fork's database. slatedb's delete_db removes every
+        // object under the fork's db path (manifests, SSTs, WAL) behind a
+        // `.deleting` marker that makes a crash mid-delete resumable, and
+        // refuses a prefix that was never a slatedb dir. External SSTs live
+        // at the parent's path, outside this prefix, so they are untouched.
+        fork_admin
+            .delete_db(true)
+            .await
+            .map_err(|e| anyhow!("Failed to delete fork '{}'s database: {}", name, e))?;
+
+        // Anything else under the fork's own prefix that isn't slatedb's —
+        // the wrapped encryption key, the bucket-id marker, zerofs
+        // `segments/` — goes too. Scoped to the fork's db path exactly:
+        // prefix listings match whole path segments, so the parent prefix
+        // and sibling forks are out of scope.
+        let mut remaining = self.object_store.list(Some(&fork_db_path));
+        while let Some(meta) = remaining.try_next().await? {
+            object_store::ObjectStoreExt::delete(&*self.object_store, &meta.location).await?;
+        }
+
+        // Registry entry LAST: a crash before this point leaves the entry
+        // in place, and a retried delete resumes from whatever objects
+        // remain (delete_db is idempotent).
+        parent_db
+            .delete_with_options(&registry_key, &WriteOptions::default())
+            .await
+            .map_err(|e| anyhow!("Failed to unregister fork '{}': {}", name, e))?;
+
+        Ok(())
+    }
+
     /// Point-read of one registry key on the parent's (writable) database.
     async fn registry_value(
         &self,
@@ -420,6 +540,7 @@ impl ForkManager {
     }
 }
 
+/// The manifest sequence id in a `<db path>/manifest/<id>.manifest` key.
 fn parse_manifest_id(location: &Path) -> Option<u64> {
     let filename = location.filename()?;
     let id = filename.strip_suffix(".manifest")?;
@@ -1202,4 +1323,170 @@ mod tests {
         assert_eq!(&data[..], b"fork data", "reopened fork reads its own file");
     }
 
+    #[tokio::test]
+    async fn delete_fork_removes_the_fork_and_leaves_parent_and_siblings() {
+        use futures::StreamExt;
+        let (parent_fs, fork_manager, object_store, _parent_path, _parent_db) =
+            new_parent_volume().await;
+        let creds = test_creds();
+        let auth = root_auth();
+
+        let (file_id, _) = parent_fs
+            .create(&creds, 0, b"base.txt", &SetAttributes::default())
+            .await
+            .unwrap();
+        parent_fs
+            .write(&auth, file_id, 0, &Bytes::from_static(b"parent data"))
+            .await
+            .unwrap();
+
+        fork_manager.create_fork("f1", None, None).await.unwrap();
+        // A sibling whose name extends f1's: prefix scoping must never catch it.
+        fork_manager.create_fork("f12", None, None).await.unwrap();
+
+        // Write data inside f1, then stop it (the operator contract for delete).
+        let (f1_fs, f1_db) =
+            open_volume(Arc::clone(&object_store), Path::from("vol/forks/f1")).await;
+        let (fork_file_id, _) = f1_fs
+            .create(&creds, 0, b"fork-only.txt", &SetAttributes::default())
+            .await
+            .unwrap();
+        f1_fs
+            .write(&auth, fork_file_id, 0, &Bytes::from_static(b"fork data"))
+            .await
+            .unwrap();
+        f1_fs.flush_coordinator.flush().await.unwrap();
+        if let SlateDbHandle::ReadWrite(db) = &f1_db {
+            db.close().await.unwrap();
+        }
+        drop(f1_fs);
+
+        fork_manager.delete_fork("f1").await.unwrap();
+
+        // The registry no longer lists f1; the sibling stays.
+        let forks = fork_manager.list_forks().await.unwrap();
+        assert_eq!(forks.len(), 1);
+        assert_eq!(forks[0].name, "f12");
+
+        // Nothing is left under the fork's own prefix...
+        let remaining: Vec<_> = object_store
+            .list(Some(&Path::from("vol/forks/f1")))
+            .collect()
+            .await;
+        assert!(
+            remaining.is_empty(),
+            "fork's object-store prefix is empty after delete: {remaining:?}"
+        );
+        // ...while the sibling fork's objects are untouched.
+        let sibling: Vec<_> = object_store
+            .list(Some(&Path::from("vol/forks/f12")))
+            .collect()
+            .await;
+        assert!(!sibling.is_empty(), "sibling fork's objects are intact");
+
+        // Parent data is intact and readable.
+        let (data, _) = parent_fs.read_file(&auth, file_id, 0, 1024).await.unwrap();
+        assert_eq!(&data[..], b"parent data");
+
+        // The sibling fork still reads across the lineage.
+        let (f12_fs, _f12_db) =
+            open_volume(Arc::clone(&object_store), Path::from("vol/forks/f12")).await;
+        let (data, _) = f12_fs.read_file(&auth, file_id, 0, 1024).await.unwrap();
+        assert_eq!(&data[..], b"parent data", "sibling still reads the parent");
+
+        // The name is free again.
+        fork_manager.create_fork("f1", None, None).await.unwrap();
+        let mut names: Vec<String> = fork_manager
+            .list_forks()
+            .await
+            .unwrap()
+            .iter()
+            .map(|f| f.name.clone())
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["f1".to_string(), "f12".to_string()]);
+    }
+
+    /// Deleting a fork deletes the unnamed checkpoint its clone pinned in the
+    /// parent's manifest — the pin that pauses the parent's segment
+    /// reclamation — while the named branch-point checkpoint survives.
+    #[tokio::test]
+    async fn delete_fork_releases_the_pin_on_the_parent_manifest() {
+        let (_parent_fs, fork_manager, object_store, _parent_path, _parent_db) =
+            new_parent_volume().await;
+
+        fork_manager.create_fork("f1", None, None).await.unwrap();
+
+        let fork_admin =
+            AdminBuilder::new(Path::from("vol/forks/f1"), Arc::clone(&object_store)).build();
+        let manifest = fork_admin
+            .read_manifest(None)
+            .await
+            .unwrap()
+            .expect("fork manifest exists");
+        let pin = manifest
+            .external_dbs()
+            .iter()
+            .find(|db| db.path == "vol")
+            .and_then(|db| db.final_checkpoint_id)
+            .expect("fork pins a final checkpoint in the parent");
+
+        let before = fork_manager.admin.list_checkpoints(None).await.unwrap();
+        assert!(
+            before.iter().any(|cp| cp.id == pin),
+            "pin present in the parent's manifest before delete"
+        );
+
+        fork_manager.delete_fork("f1").await.unwrap();
+
+        let after = fork_manager.admin.list_checkpoints(None).await.unwrap();
+        assert!(
+            !after.iter().any(|cp| cp.id == pin),
+            "pin released by the delete"
+        );
+        assert!(
+            after
+                .iter()
+                .any(|cp| cp.name.as_deref().is_some_and(|n| n.starts_with("fork-f1-"))),
+            "the named branch-point checkpoint survives"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_fork_refuses_while_children_exist() {
+        let (_parent_fs, fork_manager, object_store, _parent_path, _parent_db) =
+            new_parent_volume().await;
+
+        fork_manager.create_fork("f1", None, None).await.unwrap();
+        let (f1_fs, f1_db) =
+            open_volume(Arc::clone(&object_store), Path::from("vol/forks/f1")).await;
+        let (_, g_manager) = managers(
+            f1_db.clone(),
+            Path::from("vol/forks/f1"),
+            Arc::clone(&object_store),
+            &f1_fs,
+        );
+        g_manager.create_fork("g", None, None).await.unwrap();
+
+        let err = fork_manager.delete_fork("f1").await.unwrap_err();
+        assert!(
+            err.to_string().contains("forks of its own"),
+            "unexpected error: {err}"
+        );
+
+        // Children first, then the parent deletes cleanly.
+        g_manager.delete_fork("g").await.unwrap();
+        fork_manager.delete_fork("f1").await.unwrap();
+        assert!(fork_manager.list_forks().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn delete_fork_errors_for_an_unknown_fork() {
+        let (_fs, fork_manager, _store, _path, _db) = new_parent_volume().await;
+        let err = fork_manager.delete_fork("nope").await.unwrap_err();
+        assert!(
+            err.to_string().contains("not found"),
+            "unexpected error: {err}"
+        );
+    }
 }

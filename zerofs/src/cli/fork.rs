@@ -56,3 +56,11 @@ pub async fn list_forks(config_path: &Path) -> Result<()> {
     println!("{table}");
     Ok(())
 }
+
+pub async fn delete_fork(config_path: &Path, name: &str) -> Result<()> {
+    let client = connect_rpc_client(config_path).await?;
+    client.delete_fork(name).await?;
+
+    println!("✓ Fork '{}' deleted successfully!", name);
+    Ok(())
+}
