@@ -1,4 +1,4 @@
-//! Fork lineage metadata, persisted per fork at `<fork db path>/.zerofs_fork.json`.
+//! Fork lineage metadata, persisted as first-class records in the LSM.
 //!
 //! A fork is a writable clone of its parent volume's LSM (see
 //! [`crate::fork_manager`]). Because segment keys embed the writer epoch
@@ -8,16 +8,36 @@
 //! nearest ancestor whose `base_epoch` does not exceed it. [`ForkInfo`] is the
 //! record that makes that routing decision durable across restarts and across
 //! forks-of-forks.
+//!
+//! The record lives in two LSMs, under the keyspace's own versioning rules
+//! (see [`crate::fs::key_codec`]):
+//!
+//! - **Lineage** — a single `KeyPrefix::ForkLineage` record in the fork's OWN
+//!   database. Written at fork creation (after the clone, by opening the
+//!   freshly cloned database once), read back on every startup of the fork to
+//!   build the segment path router. A non-fork volume has no record.
+//! - **Registry** — a `KeyPrefix::ForkRegistry/<fork name>` record per fork in
+//!   the PARENT's database, so `list_forks` is a prefix scan of the parent's
+//!   own LSM. It is written strictly after the lineage record: a crash can
+//!   leave a fork whose lineage exists but no registry entry (an unlisted
+//!   fork), never a registry entry pointing at a fork without lineage.
+//!
+//! Both values are a version byte followed by JSON, so a future format change
+//! bumps the version and migrates reads.
 
+use crate::db::SlateDbHandle;
+use crate::fs::key_codec::KeyCodec;
 use anyhow::{Context, Result, anyhow};
-use object_store::{ObjectStore, ObjectStoreExt};
+use bytes::Bytes;
 use serde::{Deserialize, Serialize};
-use slatedb::object_store::path::Path;
-use std::sync::Arc;
+use slatedb::config::{DurabilityLevel, PutOptions, ReadOptions, WriteOptions};
 
-pub const FORK_INFO_FILENAME: &str = ".zerofs_fork.json";
 /// Infix under a volume's db path holding its direct forks.
 pub const FORKS_INFIX: &str = "forks";
+
+/// Version byte preceding the JSON payload of every fork record. Durable
+/// data: never reuse a lower number with a different layout.
+const RECORD_VERSION: u8 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ForkAncestor {
@@ -42,28 +62,60 @@ impl ForkInfo {
         format!("{parent_db_path}/{FORKS_INFIX}/{name}")
     }
 
-    fn info_path(db_path: &str) -> Path {
-        Path::from(format!("{db_path}/{FORK_INFO_FILENAME}"))
+    /// Encode for LSM storage: a version byte followed by JSON.
+    pub fn encode(&self) -> Result<Bytes> {
+        let json = serde_json::to_vec(self)?;
+        let mut out = Vec::with_capacity(1 + json.len());
+        out.push(RECORD_VERSION);
+        out.extend_from_slice(&json);
+        Ok(Bytes::from(out))
     }
 
-    /// Load this volume's fork metadata, or `None` when it is not a fork.
-    pub async fn load(object_store: &Arc<dyn ObjectStore>, db_path: &str) -> Result<Option<Self>> {
-        match object_store.get(&Self::info_path(db_path)).await {
-            Ok(result) => {
-                let bytes = result.bytes().await?;
-                let info = serde_json::from_slice(&bytes).context("parsing fork info")?;
-                Ok(Some(info))
-            }
-            Err(object_store::Error::NotFound { .. }) => Ok(None),
-            Err(e) => Err(anyhow!("failed to read fork info: {e}")),
+    /// Decode a stored fork record, rejecting unknown versions rather than
+    /// silently misreading a future layout.
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let (version, payload) = bytes
+            .split_first()
+            .ok_or_else(|| anyhow!("empty fork record"))?;
+        if *version != RECORD_VERSION {
+            return Err(anyhow!(
+                "unsupported fork record version {version} (expected {RECORD_VERSION})"
+            ));
         }
+        serde_json::from_slice(payload).context("parsing fork record")
     }
 
-    pub async fn save(&self, object_store: &Arc<dyn ObjectStore>, db_path: &str) -> Result<()> {
-        let bytes = serde_json::to_vec_pretty(self)?;
-        object_store
-            .put(&Self::info_path(db_path), bytes.into())
-            .await?;
+    /// Read this volume's own lineage record; `None` for a non-fork volume.
+    pub async fn load(db: &SlateDbHandle) -> Result<Option<Self>> {
+        let key = KeyCodec::new().fork_lineage_key();
+        let read_options = ReadOptions {
+            durability_filter: DurabilityLevel::Memory,
+            cache_blocks: true,
+            ..Default::default()
+        };
+        let value = match db {
+            SlateDbHandle::ReadWrite(db) => db.get_with_options(&key, &read_options).await?,
+            SlateDbHandle::ReadOnly(reader) => {
+                reader.load().get_with_options(&key, &read_options).await?
+            }
+        };
+        value.map(|bytes| Self::decode(&bytes)).transpose()
+    }
+
+    /// Write this fork's lineage record into its own (freshly cloned)
+    /// database. The caller must flush before closing: the record has to be
+    /// durable before the parent's registry entry is published (see
+    /// [`crate::fork_manager`]).
+    pub async fn save(&self, db: &slatedb::Db) -> Result<()> {
+        let key = KeyCodec::new().fork_lineage_key();
+        db.put_with_options(
+            &key,
+            &self.encode()?,
+            &PutOptions::default(),
+            &WriteOptions::default(),
+        )
+        .await
+        .map_err(|e| anyhow!("failed to write fork lineage record: {e}"))?;
         Ok(())
     }
 }
@@ -71,12 +123,10 @@ impl ForkInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use object_store::memory::InMemory;
+    use std::sync::Arc;
 
-    #[tokio::test]
-    async fn fork_info_round_trip() {
-        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-        let info = ForkInfo {
+    fn test_info() -> ForkInfo {
+        ForkInfo {
             name: "agent-1".to_string(),
             parent_db_path: "vol".to_string(),
             base_epoch: 4,
@@ -85,19 +135,78 @@ mod tests {
                 db_path: "vol".to_string(),
                 base_epoch: 0,
             }],
-        };
-        info.save(&store, "vol/forks/agent-1").await.unwrap();
+        }
+    }
 
-        let loaded = ForkInfo::load(&store, "vol/forks/agent-1")
-            .await
-            .unwrap()
-            .expect("fork info present");
+    #[test]
+    fn fork_record_encoding_round_trips_and_checks_version() {
+        let info = test_info();
+        let encoded = info.encode().unwrap();
+        let loaded = ForkInfo::decode(&encoded).unwrap();
         assert_eq!(loaded.name, "agent-1");
         assert_eq!(loaded.base_epoch, 4);
         assert_eq!(loaded.ancestors.len(), 1);
+
+        assert!(ForkInfo::decode(&[]).is_err(), "empty record rejected");
+        let mut future = encoded.to_vec();
+        future[0] = RECORD_VERSION + 1;
         assert!(
-            ForkInfo::load(&store, "vol").await.unwrap().is_none(),
-            "non-fork volume has no fork info"
+            ForkInfo::decode(&future).is_err(),
+            "unknown version rejected"
         );
+    }
+
+    #[tokio::test]
+    async fn fork_info_round_trip_through_the_lsm() {
+        let store: Arc<dyn slatedb::object_store::ObjectStore> =
+            Arc::new(slatedb::object_store::memory::InMemory::new());
+        let path = slatedb::object_store::path::Path::from("vol/forks/agent-1");
+
+        // Write the lineage record and close, then prove it survives a reopen.
+        {
+            let db = slatedb::DbBuilder::new(path.clone(), Arc::clone(&store))
+                .build()
+                .await
+                .unwrap();
+            test_info().save(&db).await.unwrap();
+            db.flush().await.unwrap();
+            db.close().await.unwrap();
+        }
+        {
+            let db = slatedb::DbBuilder::new(path, Arc::clone(&store))
+                .build()
+                .await
+                .unwrap();
+            let handle = SlateDbHandle::ReadWrite(Arc::new(db));
+            let loaded = ForkInfo::load(&handle)
+                .await
+                .unwrap()
+                .expect("lineage record present");
+            assert_eq!(loaded.name, "agent-1");
+            assert_eq!(loaded.base_epoch, 4);
+            assert_eq!(loaded.ancestors.len(), 1);
+            handle_close(handle).await;
+        }
+
+        // A non-fork volume has no lineage record.
+        let db = slatedb::DbBuilder::new(
+            slatedb::object_store::path::Path::from("vol"),
+            Arc::clone(&store),
+        )
+        .build()
+        .await
+        .unwrap();
+        let handle = SlateDbHandle::ReadWrite(Arc::new(db));
+        assert!(
+            ForkInfo::load(&handle).await.unwrap().is_none(),
+            "non-fork volume has no lineage record"
+        );
+        handle_close(handle).await;
+    }
+
+    async fn handle_close(handle: SlateDbHandle) {
+        if let SlateDbHandle::ReadWrite(db) = handle {
+            db.close().await.unwrap();
+        }
     }
 }

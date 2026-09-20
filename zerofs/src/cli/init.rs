@@ -180,18 +180,6 @@ impl StartupContext {
 
         info!("Loading or initializing encryption key from object store");
         let db_path = Path::from(actual_db_path.clone());
-        let fork_info = crate::fork_info::ForkInfo::load(&object_store, db_path.as_ref())
-            .await
-            .context("Failed to load fork info")?;
-        if let Some(info) = &fork_info {
-            info!(
-                "Volume is a fork of {} (name: {}, base epoch: {}, ancestors: {})",
-                info.parent_db_path,
-                info.name,
-                info.base_epoch,
-                info.ancestors.len()
-            );
-        }
         let encryption_key = key_management::load_or_init_encryption_key(
             &object_store,
             &db_path,
@@ -251,7 +239,9 @@ impl StartupContext {
             took_over_from_standby: false,
             recovering_handoff: false,
             opening: None,
-            fork_info,
+            // Populated in `open_db` from the volume's own LSM, once the
+            // database is open.
+            fork_info: None,
         })
     }
 
@@ -694,6 +684,23 @@ impl StartupContext {
                 None
             };
 
+        // Fork lineage comes from the fork's own LSM (written into it at fork
+        // creation; see crate::fork_info). A non-fork volume has no lineage
+        // record and routes every segment under its own db path with base
+        // epoch 0.
+        self.fork_info = crate::fork_info::ForkInfo::load(&slatedb)
+            .await
+            .context("Failed to load fork lineage")?;
+        if let Some(info) = &self.fork_info {
+            info!(
+                "Volume is a fork of {} (name: {}, base epoch: {}, ancestors: {})",
+                info.parent_db_path,
+                info.name,
+                info.base_epoch,
+                info.ancestors.len()
+            );
+        }
+
         // Segment reads share SlateDB's prefetch parts cache (one budget, keyed
         // by path); the seal-cache still serves same-process read-after-write.
         //
@@ -831,7 +838,7 @@ impl ReconciledDb {
             retrying_object_store,
             object_tracer,
             actual_db_path,
-            block_transformer: _,
+            block_transformer,
             segment_codec,
             cache_config: _,
             dedup,
@@ -1056,6 +1063,9 @@ impl ReconciledDb {
             object_store: retrying_object_store,
             db_path: actual_db_path,
             db_handle,
+            // The ForkManager needs it to open freshly cloned fork databases
+            // for their one-time lineage write.
+            block_transformer,
             authority,
         })
     }

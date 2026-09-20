@@ -794,6 +794,9 @@ pub struct InitResult {
     pub object_store: Arc<dyn object_store::ObjectStore>,
     pub db_path: String,
     pub db_handle: SlateDbHandle,
+    /// The data db's SST block transformer, retained so the ForkManager can
+    /// open freshly cloned fork databases for their one-time lineage write.
+    pub block_transformer: Arc<dyn BlockTransformer>,
     /// HA authority monitors retained through database close.
     pub authority: Option<crate::replication::AuthoritySupervisor>,
 }
@@ -975,6 +978,7 @@ pub async fn run_server(
         fork_db_handle,
         slatedb::object_store::path::Path::from(fork_db_path),
         fork_object_store,
+        init_result.block_transformer.clone(),
         Arc::clone(&checkpoint_manager),
     ));
     // Checkpoints must not durably publish a FrameLoc whose segment is still in

@@ -30,6 +30,8 @@ use bytes::Bytes;
 //   0x07 TOMBSTONE     deferred-deletion entries, scanned only by tombstone cleanup
 //   0x08 ORPHAN        open-unlinked inodes pending reclaim, drained at startup
 //   0x09 SEGCOUNT      per-segment (live, total) byte counters, segid-keyed; drives segment reclamation
+//   0x0A FORK_LINEAGE  single record holding this volume's fork lineage (present only in forks)
+//   0x0B FORK_REGISTRY per-fork registry entry, name-keyed (present only in parents of forks)
 //   0xFE EXTENT        bulk file data — the only kind in the extent segment
 
 const PREFIX_INODE: u8 = 0x01;
@@ -41,6 +43,8 @@ const PREFIX_SYSTEM: u8 = 0x06;
 const PREFIX_TOMBSTONE: u8 = 0x07;
 const PREFIX_ORPHAN: u8 = 0x08;
 const PREFIX_SEGCOUNT: u8 = 0x09;
+const PREFIX_FORK_LINEAGE: u8 = 0x0A;
+const PREFIX_FORK_REGISTRY: u8 = 0x0B;
 const PREFIX_EXTENT: u8 = 0xFE;
 
 const SYSTEM_COUNTER_KEY: &[u8; 6] = b"meta\x06\x01";
@@ -115,6 +119,8 @@ pub enum KeyPrefix {
     System,
     DirCookie,
     SegCount,
+    ForkLineage,
+    ForkRegistry,
 }
 
 impl TryFrom<u8> for KeyPrefix {
@@ -132,6 +138,8 @@ impl TryFrom<u8> for KeyPrefix {
             PREFIX_SYSTEM => Ok(Self::System),
             PREFIX_DIR_COOKIE => Ok(Self::DirCookie),
             PREFIX_SEGCOUNT => Ok(Self::SegCount),
+            PREFIX_FORK_LINEAGE => Ok(Self::ForkLineage),
+            PREFIX_FORK_REGISTRY => Ok(Self::ForkRegistry),
             _ => Err(()),
         }
     }
@@ -150,6 +158,8 @@ impl From<KeyPrefix> for u8 {
             KeyPrefix::System => PREFIX_SYSTEM,
             KeyPrefix::DirCookie => PREFIX_DIR_COOKIE,
             KeyPrefix::SegCount => PREFIX_SEGCOUNT,
+            KeyPrefix::ForkLineage => PREFIX_FORK_LINEAGE,
+            KeyPrefix::ForkRegistry => PREFIX_FORK_REGISTRY,
         }
     }
 }
@@ -167,6 +177,8 @@ impl KeyPrefix {
             Self::System => "SYSTEM",
             Self::DirCookie => "DIR_COOKIE",
             Self::SegCount => "SEGCOUNT",
+            Self::ForkLineage => "FORK_LINEAGE",
+            Self::ForkRegistry => "FORK_REGISTRY",
         }
     }
 
@@ -323,6 +335,32 @@ impl KeyCodec {
     /// Half-open `[start, end)` covering every segcount key, for a full scan.
     pub fn segcount_prefix_range(&self) -> (Bytes, Bytes) {
         self.prefix_range(KeyPrefix::SegCount)
+    }
+
+    /// Key for this volume's own fork-lineage record: a single record per
+    /// database, present only in forks (see [`crate::fork_info`]). A fork's
+    /// startup reads it to route segment reads across the lineage.
+    pub fn fork_lineage_key(&self) -> Bytes {
+        let mut key = Vec::with_capacity(self.id_offset(KeyPrefix::ForkLineage));
+        self.push_prefix(&mut key, KeyPrefix::ForkLineage);
+        Bytes::from(key)
+    }
+
+    /// Key for the registry entry naming a direct fork of this volume. One
+    /// entry per fork lives in the *parent's* database, so `list_forks` is a
+    /// prefix scan of the parent's own LSM.
+    pub fn fork_registry_key(&self, name: &str) -> Bytes {
+        let mut key = Vec::with_capacity(self.id_offset(KeyPrefix::ForkRegistry) + name.len());
+        self.push_prefix(&mut key, KeyPrefix::ForkRegistry);
+        key.extend_from_slice(name.as_bytes());
+        Bytes::from(key)
+    }
+
+    /// Prefix covering every fork-registry entry, for `scan_prefix`.
+    pub fn fork_registry_prefix(&self) -> Bytes {
+        let mut prefix = Vec::with_capacity(self.id_offset(KeyPrefix::ForkRegistry));
+        self.push_prefix(&mut prefix, KeyPrefix::ForkRegistry);
+        Bytes::from(prefix)
     }
 
     pub fn dir_entry_key(&self, dir_id: InodeId, name: &[u8]) -> Bytes {
@@ -871,6 +909,27 @@ mod tests {
         ] {
             assert_ne!(k, other);
         }
+    }
+
+
+    #[test]
+    fn fork_keys_live_in_the_meta_domain() {
+        let codec = KeyCodec::new();
+        let lineage = codec.fork_lineage_key();
+        assert!(lineage.starts_with(META_DOMAIN));
+        assert_eq!(lineage[META_DOMAIN.len()], PREFIX_FORK_LINEAGE);
+
+        let registry = codec.fork_registry_key("agent-1");
+        assert!(registry.starts_with(META_DOMAIN));
+        assert_eq!(registry[META_DOMAIN.len()], PREFIX_FORK_REGISTRY);
+        assert!(registry.ends_with(b"agent-1"));
+
+        // The registry prefix brackets every registry entry and nothing else.
+        let prefix = codec.fork_registry_prefix();
+        assert!(registry.starts_with(&prefix));
+        assert!(!codec.inode_key(9).as_ref().starts_with(&prefix));
+        assert!(!codec.segcount_key(1, 1).starts_with(&prefix));
+        assert!(!lineage.starts_with(&prefix));
     }
 
     #[test]

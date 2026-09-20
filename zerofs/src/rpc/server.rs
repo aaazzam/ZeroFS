@@ -856,10 +856,14 @@ mod tests {
             db_path.clone(),
             Arc::clone(&object_store),
         ));
+        let fork_block_transformer: Arc<dyn slatedb::BlockTransformer> =
+            ZeroFsBlockTransformer::try_new_arc(&test_key, CompressionConfig::default())
+                .expect("test key should be lockable");
         let fork_manager = Arc::new(ForkManager::new(
             db_handle.clone(),
             db_path.clone(),
             Arc::clone(&object_store),
+            fork_block_transformer,
             Arc::clone(&checkpoint_manager),
         ));
         {

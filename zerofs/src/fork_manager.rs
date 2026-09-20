@@ -11,24 +11,29 @@
 //!    parent's manifest, which also pauses reclamation of the parent's
 //!    referenced segments (same protection a persistent checkpoint gives).
 //! 3. The wrapped encryption key is copied to the fork's db path (keys are
-//!    per-path) and a [`ForkInfo`] lineage record is written, which the fork's
-//!    startup uses to route segment reads across the lineage (see
-//!    [`crate::segment_path_router`]).
+//!    per-path), the fork's freshly cloned database is opened once to write
+//!    its [`ForkInfo`] lineage record into its own LSM (durable before the
+//!    next step), and a registry entry for the fork is written into the
+//!    parent's LSM (see [`crate::fork_info`] for the two record types and the
+//!    crash-ordering guarantee).
 //!
 //! The fork is then served like any other volume: point a `[storage] url` at
-//! the fork's db path and `zerofs run`.
+//! the fork's db path and `zerofs run`; startup reads the lineage back from
+//! the fork's LSM to route segment reads across ancestors (see
+//! [`crate::segment_path_router`]).
 
 use crate::checkpoint_manager::CheckpointManager;
 use crate::db::SlateDbHandle;
-use crate::fork_info::{ForkAncestor, ForkInfo};
+use crate::fork_info::{FORKS_INFIX, ForkAncestor, ForkInfo};
+use crate::fs::key_codec::KeyCodec;
 use crate::key_management;
 use anyhow::{Context, Result, anyhow};
-use object_store::{ObjectStore, ObjectStoreExt};
 use chrono::{DateTime, Utc};
+use object_store::ObjectStore;
 use slatedb::admin::Admin;
 use slatedb::admin::AdminBuilder;
 use slatedb::admin::CloneSourceSpec;
-use slatedb::config::CheckpointOptions;
+use slatedb::config::{CheckpointOptions, PutOptions, WriteOptions};
 use slatedb::object_store::path::Path;
 use std::sync::Arc;
 use uuid::Uuid;
@@ -37,6 +42,10 @@ pub struct ForkManager {
     db_handle: SlateDbHandle,
     parent_db_path: Path,
     object_store: Arc<dyn ObjectStore>,
+    /// The volume's SST block transformer, needed to open a freshly cloned
+    /// fork database for the one-time lineage write (SST blocks are encrypted
+    /// with the same key on every volume of a lineage).
+    block_transformer: Arc<dyn slatedb::BlockTransformer>,
     checkpoint_manager: Arc<CheckpointManager>,
     admin: Admin,
 }
@@ -46,6 +55,7 @@ impl ForkManager {
         db_handle: SlateDbHandle,
         parent_db_path: Path,
         object_store: Arc<dyn ObjectStore>,
+        block_transformer: Arc<dyn slatedb::BlockTransformer>,
         checkpoint_manager: Arc<CheckpointManager>,
     ) -> Self {
         let admin = AdminBuilder::new(parent_db_path.clone(), Arc::clone(&object_store)).build();
@@ -53,6 +63,7 @@ impl ForkManager {
             db_handle,
             parent_db_path,
             object_store,
+            block_transformer,
             checkpoint_manager,
             admin,
         }
@@ -72,14 +83,16 @@ impl ForkManager {
         let name = name.trim();
         validate_fork_name(name)?;
 
-        if matches!(&self.db_handle, SlateDbHandle::ReadOnly(_)) {
+        let SlateDbHandle::ReadWrite(parent_db) = &self.db_handle else {
             return Err(anyhow!(
                 "Cannot create forks in read-only mode. Start the server without --read-only or --checkpoint flags."
             ));
-        }
+        };
 
+        let codec = KeyCodec::new();
         let fork_db_path = ForkInfo::db_path(self.parent_db_path.as_ref(), name);
-        if ForkInfo::load(&self.object_store, &fork_db_path)
+        if self
+            .registry_value(parent_db, &codec.fork_registry_key(name))
             .await?
             .is_some()
         {
@@ -116,12 +129,12 @@ impl ForkManager {
             (result.id, manifest.writer_epoch() + 1)
         } else {
             let checkpoint = match from_checkpoint.as_deref().map(str::trim) {
-            Some("") | None => {
-                let checkpoint_name = format!("fork-{name}-{}", Uuid::new_v4().simple());
-                self.checkpoint_manager
-                    .create_checkpoint(&checkpoint_name)
-                    .await?
-            }
+                Some("") | None => {
+                    let checkpoint_name = format!("fork-{name}-{}", Uuid::new_v4().simple());
+                    self.checkpoint_manager
+                        .create_checkpoint(&checkpoint_name)
+                        .await?
+                }
                 Some(checkpoint_name) => self
                     .checkpoint_manager
                     .get_checkpoint_info(checkpoint_name)
@@ -146,8 +159,9 @@ impl ForkManager {
             (checkpoint.id, source_manifest.writer_epoch() + 1)
         };
 
-        let parent_info =
-            ForkInfo::load(&self.object_store, self.parent_db_path.as_ref()).await?;
+        // The parent's own lineage (if it is itself a fork) extends the
+        // ancestor chain the fork records.
+        let parent_info = ForkInfo::load(&self.db_handle).await?;
         let mut ancestors = parent_info
             .as_ref()
             .map(|info| info.ancestors.clone())
@@ -192,7 +206,58 @@ impl ForkManager {
                 .as_secs(),
             ancestors,
         };
-        info.save(&self.object_store, &fork_db_path).await?;
+
+        // Open the freshly cloned fork database once to persist the lineage
+        // record into the fork's own LSM. Opened with the parent's durability
+        // posture (no WAL; explicit flush) so the record is SST-durable before
+        // the registry entry below publishes the fork. This open consumes the
+        // fork's first writer epoch (base_epoch), so the fork's serving open
+        // writes segments at base_epoch + 1 — routing compares `>= base_epoch`,
+        // so the gap is harmless.
+        {
+            let settings = slatedb::config::Settings {
+                wal_enabled: false,
+                flush_interval: None,
+                compactor_options: None,
+                garbage_collector_options: None,
+                compression_codec: None, // handled by the block transformer
+                ..Default::default()
+            };
+            let fork_db = slatedb::DbBuilder::new(
+                Path::from(fork_db_path.clone()),
+                Arc::clone(&self.object_store),
+            )
+            .with_settings(settings)
+            .with_block_transformer(Arc::clone(&self.block_transformer))
+            .with_filter_policies(crate::fs::filter_policy::filter_policies())
+            .with_segment_extractor(Arc::new(crate::segment_extractor::ZeroFsSegmentExtractor))
+            .build()
+            .await
+            .map_err(|e| anyhow!("Failed to open fork database '{}': {}", fork_db_path, e))?;
+            info.save(&fork_db).await?;
+            fork_db
+                .flush()
+                .await
+                .map_err(|e| anyhow!("Failed to flush fork lineage record: {}", e))?;
+            fork_db
+                .close()
+                .await
+                .map_err(|e| anyhow!("Failed to close fork database: {}", e))?;
+        }
+
+        // Registry entry LAST, into the parent's LSM: a crash can now leave a
+        // fork whose lineage is durable but unlisted (an orphan the operator
+        // can re-register), never a registry entry for a fork whose lineage
+        // record is missing.
+        parent_db
+            .put_with_options(
+                &codec.fork_registry_key(name),
+                &info.encode()?,
+                &PutOptions::default(),
+                &WriteOptions::default(),
+            )
+            .await
+            .map_err(|e| anyhow!("Failed to register fork '{}': {}", name, e))?;
 
         Ok(info)
     }
@@ -231,35 +296,55 @@ impl ForkManager {
         })
     }
 
-    /// List the direct forks of this volume.
+    /// List the direct forks of this volume: a prefix scan of the fork
+    /// registry in this volume's own LSM (see [`crate::fork_info`]).
     pub async fn list_forks(&self) -> Result<Vec<ForkInfo>> {
-        let prefix = Path::from(format!("{}/{}", self.parent_db_path, crate::fork_info::FORKS_INFIX));
-        let mut stream = self.object_store.list(Some(&prefix));
+        let prefix = KeyCodec::new().fork_registry_prefix();
+        let scan_options = slatedb::config::ScanOptions {
+            durability_filter: slatedb::config::DurabilityLevel::Memory,
+            cache_blocks: true,
+            ..Default::default()
+        };
+        let mut iter = match &self.db_handle {
+            SlateDbHandle::ReadWrite(db) => db
+                .scan_prefix_with_options(prefix, bytes::Bytes::new().., &scan_options)
+                .await
+                .map_err(|e| anyhow!("Failed to scan fork registry: {}", e))?,
+            SlateDbHandle::ReadOnly(reader) => reader
+                .load()
+                .scan_prefix_with_options(prefix, bytes::Bytes::new().., &scan_options)
+                .await
+                .map_err(|e| anyhow!("Failed to scan fork registry: {}", e))?,
+        };
         let mut forks = Vec::new();
+        while let Some(kv) = iter
+            .next()
+            .await
+            .map_err(|e| anyhow!("Failed to scan fork registry: {}", e))?
         {
-            use futures::TryStreamExt;
-            while let Some(meta) = stream.try_next().await? {
-                if !meta.location.as_ref().ends_with(crate::fork_info::FORK_INFO_FILENAME) {
-                    continue;
-                }
-                let bytes = self
-                    .object_store
-                    .get(&meta.location)
-                    .await?
-                    .bytes()
-                    .await?;
-                forks.push(
-                    serde_json::from_slice::<ForkInfo>(&bytes)
-                        .context("parsing fork info from object store")?,
-                );
-            }
+            forks.push(ForkInfo::decode(&kv.value)?);
         }
         forks.sort_by(|a, b| a.created_at.cmp(&b.created_at).then(a.name.cmp(&b.name)));
         Ok(forks)
     }
+
+    /// Point-read of one registry key on the parent's (writable) database.
+    async fn registry_value(
+        &self,
+        db: &slatedb::Db,
+        key: &bytes::Bytes,
+    ) -> Result<Option<bytes::Bytes>> {
+        let read_options = slatedb::config::ReadOptions {
+            durability_filter: slatedb::config::DurabilityLevel::Memory,
+            cache_blocks: true,
+            ..Default::default()
+        };
+        db.get_with_options(key, &read_options)
+            .await
+            .map_err(|e| anyhow!("Failed to read fork registry: {}", e))
+    }
 }
 
-/// The manifest sequence id in a `<db path>/manifest/<id>.manifest` key.
 fn parse_manifest_id(location: &Path) -> Option<u64> {
     let filename = location.filename()?;
     let id = filename.strip_suffix(".manifest")?;
@@ -289,16 +374,151 @@ mod tests {
     use crate::config::CompressionConfig;
     use crate::fs::ZeroFS;
     use crate::fs::errors::FsError;
-    use crate::fs::types::SetAttributes;
     use crate::fs::permissions::Credentials;
-    use crate::segment_path_router::SegmentPathRouter;
-    use bytes::Bytes;
     use crate::fs::types::AuthContext;
+    use crate::fs::types::SetAttributes;
+    use crate::segment_path_router::SegmentPathRouter;
+    use async_trait::async_trait;
+    use bytes::Bytes;
+    use futures::stream::BoxStream;
     use object_store::memory::InMemory;
+    use object_store::{
+        CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
+        PutMultipartOptions, PutOptions, PutPayload, PutResult,
+    };
     use slatedb::DbBuilder;
+    use std::fmt::{self, Display, Formatter};
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     const TEST_KEY: [u8; 32] = [7u8; 32];
     const TEST_PASSWORD: &str = "fork-test-password";
+
+    /// Object-store wrapper that counts `list` calls, so tests can prove the
+    /// flush-time index resolves a point-in-time manifest lookup without an
+    /// object-store listing (and that the fallback does list).
+    #[derive(Debug)]
+    struct ListCountingStore {
+        inner: Arc<dyn ObjectStore>,
+        list_calls: Arc<AtomicU64>,
+    }
+
+    impl ListCountingStore {
+        fn wrap(inner: Arc<dyn ObjectStore>) -> (Arc<dyn ObjectStore>, Arc<AtomicU64>) {
+            let list_calls = Arc::new(AtomicU64::new(0));
+            (
+                Arc::new(Self {
+                    inner,
+                    list_calls: Arc::clone(&list_calls),
+                }),
+                list_calls,
+            )
+        }
+    }
+
+    impl Display for ListCountingStore {
+        fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+            write!(f, "ListCountingStore({})", self.inner)
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for ListCountingStore {
+        async fn put_opts(
+            &self,
+            location: &Path,
+            payload: PutPayload,
+            opts: PutOptions,
+        ) -> object_store::Result<PutResult> {
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            opts: PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &Path,
+            options: GetOptions,
+        ) -> object_store::Result<GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, object_store::Result<Path>>,
+        ) -> BoxStream<'static, object_store::Result<Path>> {
+            self.inner.delete_stream(locations)
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&Path>,
+        ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+            self.list_calls.fetch_add(1, Ordering::Relaxed);
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&Path>,
+        ) -> object_store::Result<ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &Path,
+            to: &Path,
+            options: CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    /// Open a parent volume on a list-counting store: fs, fork manager, the
+    /// list-call counter, the db path, and the db handle. Opened with the
+    /// production `wal_enabled: false` posture so a flush publishes a
+    /// manifest, which is what the flush-time index records.
+    async fn counting_parent_volume() -> (
+        Arc<ZeroFS>,
+        Arc<ForkManager>,
+        Arc<AtomicU64>,
+        Path,
+        SlateDbHandle,
+    ) {
+        let (object_store, list_calls) =
+            ListCountingStore::wrap(Arc::new(InMemory::new()) as Arc<dyn ObjectStore>);
+        let db_path = Path::from("vol");
+        key_management::load_or_init_encryption_key(
+            &object_store,
+            &db_path,
+            crate::secrets::EncryptionPassword::try_new(TEST_PASSWORD).unwrap(),
+            false,
+        )
+        .await
+        .unwrap();
+        let settings = slatedb::config::Settings {
+            wal_enabled: false,
+            // No periodic background flush: the coordinator's flush must be
+            // the one that publishes (and records) the manifest.
+            flush_interval: None,
+            ..Default::default()
+        };
+        let (fs, db_handle) =
+            open_volume_with_settings(Arc::clone(&object_store), db_path.clone(), settings).await;
+        let (_, fork_manager) = managers(
+            db_handle.clone(),
+            db_path.clone(),
+            Arc::clone(&object_store),
+            &fs,
+        );
+        (fs, fork_manager, list_calls, db_path, db_handle)
+    }
 
     fn test_creds() -> Credentials {
         Credentials {
@@ -322,18 +542,29 @@ mod tests {
     }
 
     /// Open a writable volume (slatedb + ZeroFS) the way production wires it:
-    /// segment reads through a SegmentPathRouter rooted at the volume's db
-    /// path, ancestor lineage taken from `fork_info` when present.
+    /// the fork lineage is read from the volume's own LSM after the database
+    /// opens (see `StartupContext::open_db`), and segment reads go through a
+    /// SegmentPathRouter built from it.
     async fn open_volume(
         object_store: Arc<dyn ObjectStore>,
         db_path: Path,
-        fork_info: Option<ForkInfo>,
+    ) -> (Arc<ZeroFS>, SlateDbHandle) {
+        open_volume_with_settings(object_store, db_path, slatedb::config::Settings::default()).await
+    }
+
+    /// [`open_volume`] with explicit slatedb settings (e.g. the production
+    /// `wal_enabled: false` posture, under which a flush publishes a manifest).
+    async fn open_volume_with_settings(
+        object_store: Arc<dyn ObjectStore>,
+        db_path: Path,
+        settings: slatedb::config::Settings,
     ) -> (Arc<ZeroFS>, SlateDbHandle) {
         let block_transformer: Arc<dyn slatedb::BlockTransformer> =
             ZeroFsBlockTransformer::try_new_arc(&TEST_KEY, CompressionConfig::default())
                 .expect("test key should be lockable");
         let slatedb = Arc::new(
             DbBuilder::new(db_path.clone(), Arc::clone(&object_store))
+                .with_settings(settings)
                 .with_block_transformer(block_transformer)
                 .with_filter_policies(crate::fs::filter_policy::filter_policies())
                 .with_segment_extractor(Arc::new(crate::segment_extractor::ZeroFsSegmentExtractor))
@@ -342,6 +573,7 @@ mod tests {
                 .unwrap(),
         );
         let db_handle = SlateDbHandle::ReadWrite(slatedb);
+        let fork_info = ForkInfo::load(&db_handle).await.unwrap();
         let segment_store: Arc<dyn ObjectStore> = Arc::new(SegmentPathRouter::new(
             Arc::clone(&object_store),
             db_path.clone(),
@@ -396,10 +628,14 @@ mod tests {
                     .map_err(|e| anyhow!("seal+flush failed: {:?}", e))
             })
         }));
+        let block_transformer: Arc<dyn slatedb::BlockTransformer> =
+            ZeroFsBlockTransformer::try_new_arc(&TEST_KEY, CompressionConfig::default())
+                .expect("test key should be lockable");
         let fork_manager = Arc::new(ForkManager::new(
             db_handle,
             db_path,
             object_store,
+            block_transformer,
             Arc::clone(&checkpoint_manager),
         ));
         (checkpoint_manager, fork_manager)
@@ -422,7 +658,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let (fs, db_handle) = open_volume(Arc::clone(&object_store), db_path.clone(), None).await;
+        let (fs, db_handle) = open_volume(Arc::clone(&object_store), db_path.clone()).await;
         let (_, fork_manager) = managers(
             db_handle.clone(),
             db_path.clone(),
@@ -452,22 +688,17 @@ mod tests {
         assert_eq!(info.base_epoch, 2, "fork starts one epoch above the parent");
         assert_eq!(info.ancestors.len(), 1);
 
-        let loaded = ForkInfo::load(&object_store, "vol/forks/f1")
-            .await
-            .unwrap()
-            .expect("fork info persisted");
-        assert_eq!(loaded.base_epoch, 2);
-
         let forks = fork_manager.list_forks().await.unwrap();
         assert_eq!(forks.len(), 1);
         assert_eq!(forks[0].name, "f1");
 
-        let (fork_fs, _fork_db) = open_volume(
-            Arc::clone(&object_store),
-            Path::from("vol/forks/f1"),
-            Some(loaded),
-        )
-        .await;
+        let (fork_fs, fork_db) =
+            open_volume(Arc::clone(&object_store), Path::from("vol/forks/f1")).await;
+        let loaded = ForkInfo::load(&fork_db)
+            .await
+            .unwrap()
+            .expect("lineage persisted in the fork's LSM");
+        assert_eq!(loaded.base_epoch, 2);
 
         // The fork sees the parent's file (same inode id: the LSM is cloned).
         let (data, _) = fork_fs.read_file(&auth, file_id, 0, 1024).await.unwrap();
@@ -482,7 +713,10 @@ mod tests {
             .write(&auth, fork_file_id, 0, &Bytes::from_static(b"fork write"))
             .await
             .unwrap();
-        let (data, _) = fork_fs.read_file(&auth, fork_file_id, 0, 1024).await.unwrap();
+        let (data, _) = fork_fs
+            .read_file(&auth, fork_file_id, 0, 1024)
+            .await
+            .unwrap();
         assert_eq!(&data[..], b"fork write");
         assert!(matches!(
             parent_fs.lookup(&creds, 0, b"fork-only.txt").await,
@@ -523,16 +757,8 @@ mod tests {
 
         // Fork f1 and write into it.
         fork_manager.create_fork("f1", None, None).await.unwrap();
-        let f1_info = ForkInfo::load(&object_store, "vol/forks/f1")
-            .await
-            .unwrap()
-            .unwrap();
-        let (f1_fs, f1_db) = open_volume(
-            Arc::clone(&object_store),
-            Path::from("vol/forks/f1"),
-            Some(f1_info),
-        )
-        .await;
+        let (f1_fs, f1_db) =
+            open_volume(Arc::clone(&object_store), Path::from("vol/forks/f1")).await;
         let (f1_file_id, _) = f1_fs
             .create(&creds, 0, b"f1.txt", &SetAttributes::default())
             .await
@@ -550,17 +776,14 @@ mod tests {
             &f1_fs,
         );
         let g_info = g_manager.create_fork("g", None, None).await.unwrap();
-        assert_eq!(g_info.base_epoch, 3);
+        // f1 was opened twice before the checkpoint (the lineage write at
+        // creation, then the serving open above), so its writer epoch is 3.
+        assert_eq!(g_info.base_epoch, 4);
         assert_eq!(g_info.ancestors.len(), 2);
 
-        let g_loaded = ForkInfo::load(&object_store, "vol/forks/f1/forks/g")
-            .await
-            .unwrap()
-            .unwrap();
         let (g_fs, _g_db) = open_volume(
             Arc::clone(&object_store),
             Path::from("vol/forks/f1/forks/g"),
-            Some(g_loaded),
         )
         .await;
 
@@ -590,8 +813,7 @@ mod tests {
         let auth = root_auth();
 
         // Parent, first open (writer epoch 1): write file A, checkpoint it.
-        let (parent_fs, parent_db) =
-            open_volume(Arc::clone(&object_store), db_path.clone(), None).await;
+        let (parent_fs, parent_db) = open_volume(Arc::clone(&object_store), db_path.clone()).await;
         let (file_a, _) = parent_fs
             .create(&creds, 0, b"a.txt", &SetAttributes::default())
             .await
@@ -612,8 +834,7 @@ mod tests {
         }
 
         // Parent restarts (writer epoch bumps to 2) and writes file B.
-        let (parent_fs, parent_db) =
-            open_volume(Arc::clone(&object_store), db_path.clone(), None).await;
+        let (parent_fs, parent_db) = open_volume(Arc::clone(&object_store), db_path.clone()).await;
         let (file_b, _) = parent_fs
             .create(&creds, 0, b"b.txt", &SetAttributes::default())
             .await
@@ -641,17 +862,9 @@ mod tests {
         );
 
         // The fork sees the old state, not file B, and its own writes at
-        // epoch 2 route to itself (not to the parent).
-        let fork_info = ForkInfo::load(&object_store, "vol/forks/past")
-            .await
-            .unwrap()
-            .unwrap();
-        let (fork_fs, _fork_db) = open_volume(
-            Arc::clone(&object_store),
-            Path::from("vol/forks/past"),
-            Some(fork_info),
-        )
-        .await;
+        // epoch >= 2 route to itself (not to the parent).
+        let (fork_fs, _fork_db) =
+            open_volume(Arc::clone(&object_store), Path::from("vol/forks/past")).await;
         let (data, _) = fork_fs.read_file(&auth, file_a, 0, 1024).await.unwrap();
         assert_eq!(&data[..], b"old state");
         assert!(matches!(
@@ -731,27 +944,93 @@ mod tests {
             .create_fork("pit", None, Some(target))
             .await
             .unwrap();
-        let fork_info = ForkInfo::load(&object_store, "vol/forks/pit")
-            .await
-            .unwrap()
-            .unwrap();
-        let (fork_fs, _fork_db) = open_volume(
-            Arc::clone(&object_store),
-            Path::from("vol/forks/pit"),
-            Some(fork_info),
-        )
-        .await;
+        let (fork_fs, _fork_db) =
+            open_volume(Arc::clone(&object_store), Path::from("vol/forks/pit")).await;
 
         let (data, _) = fork_fs.read_file(&auth, file_a, 0, 1024).await.unwrap();
-        assert_eq!(&data[..], b"state A", "fork sees the state at the timestamp");
+        assert_eq!(
+            &data[..],
+            b"state A",
+            "fork sees the state at the timestamp"
+        );
         assert!(matches!(
             fork_fs.lookup(&creds, 0, b"b.txt").await,
             Err(FsError::NotFound)
         ));
         assert_eq!(info.base_epoch, 2);
-        assert!(fork_manager
-            .create_fork("too-early", None, Some(chrono::DateTime::UNIX_EPOCH))
+        assert!(
+            fork_manager
+                .create_fork("too-early", None, Some(chrono::DateTime::UNIX_EPOCH))
+                .await
+                .is_err()
+        );
+    }
+
+    /// The flush-time index resolves a point-in-time lookup with no
+    /// object-store listing at all.
+
+    /// A volume whose flush-time index is empty (flushed before the index
+    /// existed — here simulated by flushing the raw slatedb handle, bypassing
+    /// the flush coordinator) still resolves via the manifest listing.
+
+    /// The registry lives in the parent's LSM and the lineage in the fork's
+    /// own LSM: a fork reopened from cold (no metadata side-file anywhere)
+    /// still lists from the parent and routes segment reads across the
+    /// lineage.
+    #[tokio::test]
+    async fn reopened_fork_reads_its_lineage_from_the_lsm() {
+        let (parent_fs, fork_manager, object_store, _parent_path, _parent_db) =
+            new_parent_volume().await;
+        let creds = test_creds();
+        let auth = root_auth();
+
+        let (file_id, _) = parent_fs
+            .create(&creds, 0, b"base.txt", &SetAttributes::default())
             .await
-            .is_err());
+            .unwrap();
+        parent_fs
+            .write(&auth, file_id, 0, &Bytes::from_static(b"base"))
+            .await
+            .unwrap();
+
+        fork_manager.create_fork("f1", None, None).await.unwrap();
+        let forks = fork_manager.list_forks().await.unwrap();
+        assert_eq!(forks.len(), 1);
+        assert_eq!(forks[0].name, "f1");
+
+        // First open: write fork-local data and close the fork's database.
+        let (fork_fs, fork_db) =
+            open_volume(Arc::clone(&object_store), Path::from("vol/forks/f1")).await;
+        let (fork_file_id, _) = fork_fs
+            .create(&creds, 0, b"fork.txt", &SetAttributes::default())
+            .await
+            .unwrap();
+        fork_fs
+            .write(&auth, fork_file_id, 0, &Bytes::from_static(b"fork data"))
+            .await
+            .unwrap();
+        fork_fs.flush_coordinator.flush().await.unwrap();
+        if let SlateDbHandle::ReadWrite(db) = &fork_db {
+            db.close().await.unwrap();
+        }
+        drop(fork_fs);
+
+        // Reopen: open_volume loads the lineage from the fork's own LSM the
+        // way startup does, so ancestor and own segments still route.
+        let (fork_fs, fork_db) =
+            open_volume(Arc::clone(&object_store), Path::from("vol/forks/f1")).await;
+        let loaded = ForkInfo::load(&fork_db)
+            .await
+            .unwrap()
+            .expect("lineage survived the reopen");
+        assert_eq!(loaded.base_epoch, 2);
+
+        let (data, _) = fork_fs.read_file(&auth, file_id, 0, 1024).await.unwrap();
+        assert_eq!(&data[..], b"base", "reopened fork reads the parent's file");
+        let (data, _) = fork_fs
+            .read_file(&auth, fork_file_id, 0, 1024)
+            .await
+            .unwrap();
+        assert_eq!(&data[..], b"fork data", "reopened fork reads its own file");
     }
 }
