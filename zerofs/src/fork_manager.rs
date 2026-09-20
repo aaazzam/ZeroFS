@@ -264,11 +264,86 @@ impl ForkManager {
 
     /// The id of the last manifest flushed at or before `target`.
     ///
-    /// Manifests are immutable, monotonically numbered objects under
-    /// `<db path>/manifest/`, each stamped with the object store's
-    /// last-modified time (the flush publication time), so a timestamp maps
-    /// to a point in the volume's history without any extra bookkeeping.
+    /// Two resolution paths:
+    ///
+    /// 1. **Flush-time index** (fast path): the flush coordinator records each
+    ///    flush's wall-clock time in the volume's own LSM
+    ///    (`KeyPrefix::FlushTime`, see [`crate::fs::flush_coordinator`]), so a
+    ///    timestamp resolves to the greatest indexed manifest id at or before
+    ///    `target` with no object-store I/O.
+    /// 2. **Manifest listing** (fallback): engages when the index has no entry
+    ///    at or before `target` — volumes written before the index existed, or
+    ///    a row lost to the index's best-effort write. Manifests are
+    ///    immutable, monotonically numbered objects under
+    ///    `<db path>/manifest/`, each stamped with the object store's
+    ///    last-modified time (the flush publication time), so listing them
+    ///    reproduces the same answer.
     pub async fn manifest_at_time(&self, target: DateTime<Utc>) -> Result<u64> {
+        if let Some(id) = self.manifest_at_time_from_index(target).await? {
+            return Ok(id);
+        }
+        self.manifest_at_time_from_listing(target).await
+    }
+
+    /// Index path of [`Self::manifest_at_time`]: the greatest manifest id
+    /// whose recorded flush time is at or before `target`; `None` when the
+    /// index has no such entry (the listing fallback engages). The index is
+    /// keyed by manifest id and scanned in full — one small row per flush.
+    async fn manifest_at_time_from_index(&self, target: DateTime<Utc>) -> Result<Option<u64>> {
+        // Index timestamps are (epoch seconds, nanos); a pre-epoch target
+        // cannot match.
+        let Ok(target_secs) = u64::try_from(target.timestamp()) else {
+            return Ok(None);
+        };
+        let target_time = (target_secs, target.timestamp_subsec_nanos());
+        let codec = KeyCodec::new();
+        let scan_options = slatedb::config::ScanOptions {
+            durability_filter: slatedb::config::DurabilityLevel::Memory,
+            cache_blocks: true,
+            ..Default::default()
+        };
+        let mut iter = match &self.db_handle {
+            SlateDbHandle::ReadWrite(db) => db
+                .scan_prefix_with_options(
+                    codec.flush_time_prefix(),
+                    bytes::Bytes::new()..,
+                    &scan_options,
+                )
+                .await
+                .map_err(|e| anyhow!("Failed to scan flush-time index: {}", e))?,
+            SlateDbHandle::ReadOnly(reader) => reader
+                .load()
+                .scan_prefix_with_options(
+                    codec.flush_time_prefix(),
+                    bytes::Bytes::new()..,
+                    &scan_options,
+                )
+                .await
+                .map_err(|e| anyhow!("Failed to scan flush-time index: {}", e))?,
+        };
+        let mut best: Option<u64> = None;
+        while let Some(kv) = iter
+            .next()
+            .await
+            .map_err(|e| anyhow!("Failed to scan flush-time index: {}", e))?
+        {
+            let Some(manifest_id) = codec.parse_flush_time_key(&kv.key) else {
+                continue;
+            };
+            let Some(flushed_at) = KeyCodec::decode_flush_time(&kv.value) else {
+                continue;
+            };
+            if flushed_at <= target_time && best.is_none_or(|b| manifest_id > b) {
+                best = Some(manifest_id);
+            }
+        }
+        Ok(best)
+    }
+
+    /// Listing path of [`Self::manifest_at_time`]: the last manifest object
+    /// under `<db path>/manifest/` whose last-modified time is at or before
+    /// `target`.
+    async fn manifest_at_time_from_listing(&self, target: DateTime<Utc>) -> Result<u64> {
         let prefix = Path::from(format!("{}/manifest", self.parent_db_path));
         let mut stream = self.object_store.list(Some(&prefix));
         let mut best: Option<(u64, DateTime<Utc>)> = None;
@@ -968,10 +1043,103 @@ mod tests {
 
     /// The flush-time index resolves a point-in-time lookup with no
     /// object-store listing at all.
+    #[tokio::test]
+    async fn manifest_at_time_resolves_through_the_flush_time_index() {
+        let (parent_fs, fork_manager, list_calls, _db_path, db_handle) =
+            counting_parent_volume().await;
+        let creds = test_creds();
+        let auth = root_auth();
+
+        let (file_id, _) = parent_fs
+            .create(&creds, 0, b"a.txt", &SetAttributes::default())
+            .await
+            .unwrap();
+        parent_fs
+            .write(&auth, file_id, 0, &Bytes::from_static(b"state A"))
+            .await
+            .unwrap();
+        parent_fs.flush_coordinator.flush().await.unwrap();
+
+        // The coordinator writes the index row after replying to the flush, so
+        // poll briefly for it. Far-future target: every recorded row qualifies.
+        let target = Utc::now() + chrono::Duration::hours(1);
+        let indexed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Some(id) = fork_manager
+                    .manifest_at_time_from_index(target)
+                    .await
+                    .unwrap()
+                {
+                    break id;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("flush-time index row recorded");
+
+        let lists_before = list_calls.load(Ordering::Relaxed);
+        let resolved = fork_manager.manifest_at_time(target).await.unwrap();
+        assert_eq!(resolved, indexed);
+        assert_eq!(
+            list_calls.load(Ordering::Relaxed),
+            lists_before,
+            "index hit must not list the object store"
+        );
+
+        // The index row names the manifest the flush published.
+        let SlateDbHandle::ReadWrite(db) = &db_handle else {
+            panic!("parent volume is writable");
+        };
+        assert!(indexed <= db.subscribe().borrow().current_manifest.id());
+        assert!(indexed >= 1);
+    }
 
     /// A volume whose flush-time index is empty (flushed before the index
     /// existed — here simulated by flushing the raw slatedb handle, bypassing
     /// the flush coordinator) still resolves via the manifest listing.
+    #[tokio::test]
+    async fn manifest_at_time_falls_back_to_listing_when_the_index_is_empty() {
+        let (parent_fs, fork_manager, list_calls, _db_path, db_handle) =
+            counting_parent_volume().await;
+        let creds = test_creds();
+        let auth = root_auth();
+
+        let (file_id, _) = parent_fs
+            .create(&creds, 0, b"a.txt", &SetAttributes::default())
+            .await
+            .unwrap();
+        parent_fs
+            .write(&auth, file_id, 0, &Bytes::from_static(b"state A"))
+            .await
+            .unwrap();
+        // Flush WITHOUT the flush coordinator: manifests exist, no index row.
+        let SlateDbHandle::ReadWrite(db) = &db_handle else {
+            panic!("parent volume is writable");
+        };
+        db.flush().await.unwrap();
+        let current_manifest = db.subscribe().borrow().current_manifest.id();
+
+        let target = Utc::now() + chrono::Duration::hours(1);
+        assert!(
+            fork_manager
+                .manifest_at_time_from_index(target)
+                .await
+                .unwrap()
+                .is_none(),
+            "no flush coordinator flush => empty index"
+        );
+
+        let lists_before = list_calls.load(Ordering::Relaxed);
+        let resolved = fork_manager.manifest_at_time(target).await.unwrap();
+        assert!(
+            list_calls.load(Ordering::Relaxed) > lists_before,
+            "empty index engages the listing fallback"
+        );
+        // Background slatedb flushes may publish newer manifests after the
+        // explicit one; the fallback resolves the newest at or before target.
+        assert!(resolved >= current_manifest);
+    }
 
     /// The registry lives in the parent's LSM and the lineage in the fork's
     /// own LSM: a fork reopened from cold (no metadata side-file anywhere)
@@ -1033,4 +1201,5 @@ mod tests {
             .unwrap();
         assert_eq!(&data[..], b"fork data", "reopened fork reads its own file");
     }
+
 }

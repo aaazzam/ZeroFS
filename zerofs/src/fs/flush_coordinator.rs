@@ -3,6 +3,7 @@ use crate::db::Db;
 use crate::failpoints::{self as fp, fail_point};
 use crate::fs::errors::FsError;
 use crate::fs::inode::InodeId;
+use crate::fs::key_codec::KeyCodec;
 use crate::manifest_publication::ManifestPublication;
 use crate::task::spawn_named;
 use dashmap::DashMap;
@@ -11,6 +12,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 
@@ -107,6 +109,76 @@ async fn seal_and_flush(db: &Db, shared: &Shared) -> Result<(), FsError> {
     flush_result
 }
 
+/// Bounds how long [`record_flush_time`] waits for the flush's manifest to
+/// appear in the db state before giving up. A flush that publishes no
+/// manifest (a WAL-only flush) never advances the id, so the wait times out
+/// and no row is written; the listing fallback covers resolution.
+const FLUSH_TIME_MANIFEST_WAIT: Duration = Duration::from_secs(5);
+
+/// Poll cadence for [`record_flush_time`]'s manifest-advance wait.
+const FLUSH_TIME_MANIFEST_POLL: Duration = Duration::from_millis(25);
+
+/// Best-effort write of the flush-time index (`KeyPrefix::FlushTime`): stamps
+/// the manifest this flush cycle published with the time the advance was
+/// observed (which trails the publication by at most the poll cadence), so
+/// point-in-time forks can resolve a timestamp to a manifest without listing
+/// the object store (see [`crate::fork_manager::ForkManager::manifest_at_time`]).
+///
+/// Runs as a detached task after the flush barrier is released and after
+/// flush waiters have been replied to, so it adds no latency to the flush
+/// path and never stalls the coordinator. Keyed by manifest id, so
+/// re-recording the same manifest is idempotent. A failure is logged and
+/// swallowed — the index is a hint, and the manifest-listing fallback covers
+/// any row that is missing (lost write, or volumes flushed before the index
+/// existed).
+///
+/// `manifest_before` is the manifest id observed just before the flush cycle.
+/// A row is written only once the id advances past it: with the WAL enabled,
+/// `db.flush()` flushes the WAL without publishing a manifest, so the
+/// then-current manifest does not cover the flushed data and recording it
+/// would resolve point-in-time lookups to a state *older* than the flush.
+/// Skipping the row engages the listing fallback instead, which sees every
+/// published manifest. The flush's manifest is applied to the db state just
+/// after the flush resolves, so the advance is polled for rather than read
+/// once.
+fn record_flush_time(db: &Arc<Db>, manifest_before: Option<u64>) {
+    let db = Arc::clone(db);
+    crate::task::spawn_named("flush-time-index", async move {
+        let before = manifest_before.unwrap_or(0);
+        let manifest_id = tokio::time::timeout(FLUSH_TIME_MANIFEST_WAIT, async {
+            loop {
+                let id = db.current_manifest_id();
+                if id.is_some_and(|id| id > before) {
+                    return id;
+                }
+                tokio::time::sleep(FLUSH_TIME_MANIFEST_POLL).await;
+            }
+        })
+        .await
+        .unwrap_or_default();
+        let Some(manifest_id) = manifest_id else {
+            return;
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        let codec = KeyCodec::new();
+        if let Err(error) = db
+            .try_put(
+                &codec.flush_time_key(manifest_id),
+                &KeyCodec::encode_flush_time(now.as_secs(), now.subsec_nanos()),
+            )
+            .await
+        {
+            tracing::warn!(
+                manifest_id,
+                %error,
+                "flush-time index write failed; point-in-time forks fall back to manifest listing"
+            );
+        }
+    });
+}
+
 #[derive(Clone)]
 pub struct FlushCoordinator {
     sender: mpsc::UnboundedSender<Request>,
@@ -147,6 +219,7 @@ impl FlushCoordinator {
                 // A close keeps the barrier through db.close(), leaving no gap
                 // in which a FrameLoc can commit after the final seal.
                 let barrier = db.flush_barrier().write_owned().await;
+                let manifest_before = db.current_manifest_id();
                 let result = seal_and_flush(&db, &worker_shared).await;
 
                 // Drain requests covered by this flush before releasing the barrier.
@@ -191,6 +264,14 @@ impl FlushCoordinator {
 
                 for sender in pending_senders.drain(..) {
                     let _ = sender.send(result);
+                }
+                // Flush-time index: the barrier is released and waiters replied
+                // to, and the write runs detached, so it is fully off the
+                // flush's critical path. Skipped when the cycle closes the db
+                // (a write would fail against the closed handle) and on flush
+                // failure.
+                if result.is_ok() && closer.is_none() {
+                    record_flush_time(&db, manifest_before);
                 }
                 // Keep the inode map proportional to mutations since the latest
                 // flush without extending the exclusive write barrier. Racing
@@ -441,6 +522,86 @@ mod tests {
         assert_eq!(
             coordinator.requested_flush_count(),
             requests_after_global_flush
+        );
+    }
+
+    async fn flush_time_rows(db: &Db) -> Vec<(u64, (u64, u32))> {
+        use futures::StreamExt;
+        let codec = crate::fs::key_codec::KeyCodec::new();
+        let (start, end) = codec.prefix_range(crate::fs::key_codec::KeyPrefix::FlushTime);
+        let mut rows = Vec::new();
+        let mut stream = db.scan(start..end).await.unwrap();
+        while let Some(item) = stream.next().await {
+            let (key, value) = item.unwrap();
+            let manifest_id = codec.parse_flush_time_key(&key).unwrap();
+            let flushed_at = crate::fs::key_codec::KeyCodec::decode_flush_time(&value).unwrap();
+            rows.push((manifest_id, flushed_at));
+        }
+        rows
+    }
+
+    /// Coordinator over a db with the production durability posture
+    /// (`wal_enabled: false`): a flush memtable-flushes and publishes a new
+    /// manifest, which is what the flush-time index records. The periodic
+    /// background flush is disabled so the coordinator's flush is the one
+    /// that publishes (and records) the manifest.
+    async fn coordinator_with_memtable_flush() -> (FlushCoordinator, Arc<Db>) {
+        let store: Arc<dyn slatedb::object_store::ObjectStore> = Arc::new(InMemory::new());
+        let settings = slatedb::config::Settings {
+            wal_enabled: false,
+            flush_interval: None,
+            ..Default::default()
+        };
+        let raw = Arc::new(
+            slatedb::DbBuilder::new(Path::from("flush-time-index-test"), store)
+                .with_settings(settings)
+                .build()
+                .await
+                .unwrap(),
+        );
+        let db = Arc::new(Db::new(raw, None));
+        let coordinator = FlushCoordinator::new(Arc::clone(&db));
+        coordinator.set_sealer(Arc::new(|| Box::pin(async { Ok(()) })));
+        (coordinator, db)
+    }
+
+    #[tokio::test]
+    async fn flush_records_a_flush_time_index_row() {
+        let (coordinator, db) = coordinator_with_memtable_flush().await;
+        let before = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap();
+
+        mark_committed(&coordinator, &db, 1, b"row").await;
+        coordinator.flush().await.unwrap();
+
+        // The index row is written by a detached task after flush waiters are
+        // replied to (off the flush's critical path), so poll for it to land.
+        let rows = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let rows = flush_time_rows(&db).await;
+                if !rows.is_empty() {
+                    break rows;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("flush-time index row recorded");
+
+        assert_eq!(rows.len(), 1);
+        let (manifest_id, flushed_at) = rows[0];
+        assert!(manifest_id >= 1, "sane manifest id: {manifest_id}");
+        // The record task stamps the row when it observes the flush's
+        // manifest, which trails the flush itself: the timestamp must be at
+        // or after the flush started and not in the future.
+        let flushed_at = std::time::Duration::new(flushed_at.0, flushed_at.1);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap();
+        assert!(
+            (before..=now).contains(&flushed_at),
+            "flush time {flushed_at:?} within [{before:?}, {now:?}]"
         );
     }
 

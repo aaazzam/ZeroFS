@@ -32,6 +32,7 @@ use bytes::Bytes;
 //   0x09 SEGCOUNT      per-segment (live, total) byte counters, segid-keyed; drives segment reclamation
 //   0x0A FORK_LINEAGE  single record holding this volume's fork lineage (present only in forks)
 //   0x0B FORK_REGISTRY per-fork registry entry, name-keyed (present only in parents of forks)
+//   0x0C FLUSH_TIME    flush-time index: manifest_id -> flush wall-clock time, one row per flush
 //   0xFE EXTENT        bulk file data — the only kind in the extent segment
 
 const PREFIX_INODE: u8 = 0x01;
@@ -45,6 +46,7 @@ const PREFIX_ORPHAN: u8 = 0x08;
 const PREFIX_SEGCOUNT: u8 = 0x09;
 const PREFIX_FORK_LINEAGE: u8 = 0x0A;
 const PREFIX_FORK_REGISTRY: u8 = 0x0B;
+const PREFIX_FLUSH_TIME: u8 = 0x0C;
 const PREFIX_EXTENT: u8 = 0xFE;
 
 const SYSTEM_COUNTER_KEY: &[u8; 6] = b"meta\x06\x01";
@@ -66,6 +68,11 @@ const SYSTEM_TAINT_KEY: &[u8; 6] = b"meta\x06\x04";
 // Wall-clock epoch-seconds (u64 LE via encode_u64) of the last completed slow
 // orphan sweep.
 const SYSTEM_ORPHAN_SWEEP_KEY: &[u8; 6] = b"meta\x06\x05";
+
+/// Version byte preceding the timestamp payload of every flush-time index
+/// value (see [`KeyCodec::encode_flush_time`]). Durable data: never reuse a
+/// lower number with a different layout.
+const FLUSH_TIME_RECORD_VERSION: u8 = 1;
 
 const U64_SIZE: usize = std::mem::size_of::<u64>();
 
@@ -121,6 +128,7 @@ pub enum KeyPrefix {
     SegCount,
     ForkLineage,
     ForkRegistry,
+    FlushTime,
 }
 
 impl TryFrom<u8> for KeyPrefix {
@@ -140,6 +148,7 @@ impl TryFrom<u8> for KeyPrefix {
             PREFIX_SEGCOUNT => Ok(Self::SegCount),
             PREFIX_FORK_LINEAGE => Ok(Self::ForkLineage),
             PREFIX_FORK_REGISTRY => Ok(Self::ForkRegistry),
+            PREFIX_FLUSH_TIME => Ok(Self::FlushTime),
             _ => Err(()),
         }
     }
@@ -160,6 +169,7 @@ impl From<KeyPrefix> for u8 {
             KeyPrefix::SegCount => PREFIX_SEGCOUNT,
             KeyPrefix::ForkLineage => PREFIX_FORK_LINEAGE,
             KeyPrefix::ForkRegistry => PREFIX_FORK_REGISTRY,
+            KeyPrefix::FlushTime => PREFIX_FLUSH_TIME,
         }
     }
 }
@@ -179,6 +189,7 @@ impl KeyPrefix {
             Self::SegCount => "SEGCOUNT",
             Self::ForkLineage => "FORK_LINEAGE",
             Self::ForkRegistry => "FORK_REGISTRY",
+            Self::FlushTime => "FLUSH_TIME",
         }
     }
 
@@ -361,6 +372,72 @@ impl KeyCodec {
         let mut prefix = Vec::with_capacity(self.id_offset(KeyPrefix::ForkRegistry));
         self.push_prefix(&mut prefix, KeyPrefix::ForkRegistry);
         Bytes::from(prefix)
+    }
+
+    /// Flush-time index entry: `manifest_id -> flush wall-clock time`, one row
+    /// per completed flush, written by the flush coordinator after the flush
+    /// barrier (see [`crate::fs::flush_coordinator`]). Point-in-time forks
+    /// resolve a timestamp to the greatest indexed manifest id at or before it
+    /// (see [`crate::fork_manager::ForkManager::manifest_at_time`]). The
+    /// manifest id is big-endian so a prefix scan visits flushes in
+    /// publication order.
+    pub fn flush_time_key(&self, manifest_id: u64) -> Bytes {
+        let mut key = Vec::with_capacity(self.id_offset(KeyPrefix::FlushTime) + U64_SIZE);
+        self.push_prefix(&mut key, KeyPrefix::FlushTime);
+        key.extend_from_slice(&manifest_id.to_be_bytes());
+        Bytes::from(key)
+    }
+
+    /// Manifest id of a flush-time index key.
+    pub fn parse_flush_time_key(&self, key: &[u8]) -> Option<u64> {
+        let id_off = self.id_offset(KeyPrefix::FlushTime);
+        if key.len() != id_off + U64_SIZE
+            || !key.starts_with(META_DOMAIN)
+            || key[self.kind_offset(KeyPrefix::FlushTime)] != PREFIX_FLUSH_TIME
+        {
+            return None;
+        }
+        Some(u64::from_be_bytes(key[id_off..].try_into().ok()?))
+    }
+
+    /// Prefix covering every flush-time index entry, for `scan_prefix`.
+    pub fn flush_time_prefix(&self) -> Bytes {
+        let mut prefix = Vec::with_capacity(self.id_offset(KeyPrefix::FlushTime));
+        self.push_prefix(&mut prefix, KeyPrefix::FlushTime);
+        Bytes::from(prefix)
+    }
+
+    /// Encode a flush-time index value: a version byte followed by the flush
+    /// time as `(epoch seconds, sub-second nanos)`, both little-endian. The
+    /// version byte follows the fork-record convention (`0x01 || payload`, see
+    /// [`crate::fork_info`]); the payload itself is fixed-width LE integers
+    /// like every other scalar value in this keyspace (see
+    /// [`Self::encode_u64`]) — JSON would buy nothing for two integers.
+    ///
+    /// Sub-second precision matters: a point-in-time target can fall within
+    /// the same second as a later flush, and second granularity would let
+    /// that later flush's manifest compare `<=` the target and be wrongly
+    /// selected. Index writes are best-effort and idempotent (keyed by
+    /// manifest id), so a re-recorded flush simply overwrites its row.
+    pub fn encode_flush_time(epoch_seconds: u64, subsec_nanos: u32) -> Bytes {
+        let mut v = Vec::with_capacity(1 + U64_SIZE + 4);
+        v.push(FLUSH_TIME_RECORD_VERSION);
+        v.extend_from_slice(&epoch_seconds.to_le_bytes());
+        v.extend_from_slice(&subsec_nanos.to_le_bytes());
+        Bytes::from(v)
+    }
+
+    /// Decode a flush-time index value into `(epoch seconds, sub-second
+    /// nanos)`, rejecting unknown versions rather than silently misreading a
+    /// future layout.
+    pub fn decode_flush_time(data: &[u8]) -> Option<(u64, u32)> {
+        let (&version, payload) = data.split_first()?;
+        if version != FLUSH_TIME_RECORD_VERSION || payload.len() != U64_SIZE + 4 {
+            return None;
+        }
+        let secs = u64::from_le_bytes(payload[..U64_SIZE].try_into().ok()?);
+        let nanos = u32::from_le_bytes(payload[U64_SIZE..].try_into().ok()?);
+        Some((secs, nanos))
     }
 
     pub fn dir_entry_key(&self, dir_id: InodeId, name: &[u8]) -> Bytes {
@@ -911,6 +988,44 @@ mod tests {
         }
     }
 
+    #[test]
+    fn flush_time_keys_order_by_manifest_id_and_roundtrip() {
+        let codec = KeyCodec::new();
+        let key = codec.flush_time_key(42);
+        assert!(key.starts_with(META_DOMAIN));
+        assert_eq!(
+            key[codec.kind_offset(KeyPrefix::FlushTime)],
+            PREFIX_FLUSH_TIME
+        );
+        assert_eq!(codec.parse_flush_time_key(&key), Some(42));
+
+        // Big-endian manifest id => publication-order scan.
+        assert!(codec.flush_time_key(2).as_ref() < codec.flush_time_key(10).as_ref());
+
+        // The prefix brackets every index entry and nothing else.
+        let prefix = codec.flush_time_prefix();
+        assert!(key.starts_with(&prefix));
+        assert!(!codec.fork_registry_key("f1").starts_with(&prefix));
+        assert!(!codec.fork_lineage_key().starts_with(&prefix));
+        assert!(!codec.inode_key(42).as_ref().starts_with(&prefix));
+        assert_eq!(
+            codec.parse_flush_time_key(codec.inode_key(42).as_ref()),
+            None
+        );
+
+        // Value: version byte + (epoch seconds, nanos), roundtripping and
+        // rejecting unknown versions and wrong lengths.
+        let encoded = KeyCodec::encode_flush_time(1_700_000_000, 42);
+        assert_eq!(
+            KeyCodec::decode_flush_time(&encoded),
+            Some((1_700_000_000, 42))
+        );
+        let mut future = encoded.to_vec();
+        future[0] = FLUSH_TIME_RECORD_VERSION + 1;
+        assert_eq!(KeyCodec::decode_flush_time(&future), None);
+        assert_eq!(KeyCodec::decode_flush_time(&encoded[..4]), None);
+        assert_eq!(KeyCodec::decode_flush_time(&[]), None);
+    }
 
     #[test]
     fn fork_keys_live_in_the_meta_domain() {

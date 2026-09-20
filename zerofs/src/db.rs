@@ -442,6 +442,34 @@ impl Db {
             .map_or(0, |status| status.borrow().durable_seq)
     }
 
+    /// Manifest id of the live in-memory manifest snapshot, for the
+    /// flush-time index (`KeyPrefix::FlushTime`). Read directly from the db
+    /// state (not the status watch, whose notification can lag the flush that
+    /// published the manifest). `None` on a read-only handle, which has no
+    /// flush path.
+    pub(crate) fn current_manifest_id(&self) -> Option<u64> {
+        match &self.inner {
+            SlateDbHandle::ReadWrite(db) => Some(db.manifest().id()),
+            SlateDbHandle::ReadOnly(_) => None,
+        }
+    }
+
+    /// Best-effort bookkeeping write that returns its error to the caller
+    /// instead of taking the process-fatal serving path
+    /// ([`exit_on_write_error`]). For writes whose loss is tolerable — the
+    /// flush-time index is one: a missed row just engages the manifest-listing
+    /// fallback in [`crate::fork_manager::ForkManager::manifest_at_time`].
+    pub(crate) async fn try_put(&self, key: &Bytes, value: &[u8]) -> Result<()> {
+        match &self.inner {
+            SlateDbHandle::ReadWrite(db) => db
+                .put_with_options(key, value, &PutOptions::default(), &WriteOptions::default())
+                .await
+                .map(|_| ())
+                .map_err(|e| anyhow::anyhow!("best-effort put failed: {e}")),
+            SlateDbHandle::ReadOnly(_) => Err(FsError::ReadOnlyFilesystem.into()),
+        }
+    }
+
     /// Attach the HA leader lease; reads/writes are then refused while it is
     /// invalid. Single-node `Db`s have no lease and are never gated.
     pub fn with_lease(mut self, lease: Arc<crate::replication::Lease>) -> Self {
