@@ -197,6 +197,9 @@ impl DirectoryStore {
         dir_id: InodeId,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<DirEntryInfo, FsError>> + Send + '_>>, FsError>
     {
+        if !self.key_codec.branch().is_root() {
+            return self.list_branch_entries(dir_id, 0).await;
+        }
         let prefix = Bytes::from(self.key_codec.dir_scan_prefix(dir_id));
         let codec = self.key_codec.clone();
 
@@ -244,6 +247,14 @@ impl DirectoryStore {
         resume_after_cookie: u64,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<DirEntryInfo, FsError>> + Send + '_>>, FsError>
     {
+        if !self.key_codec.branch().is_root() {
+            // Branch cookies are synthetic positions (see
+            // `list_branch_entries`); resume re-enumerates and skips.
+            let skip = resume_after_cookie
+                .checked_sub(COOKIE_FIRST_ENTRY)
+                .map_or(0, |position| position + 1);
+            return self.list_branch_entries(dir_id, skip).await;
+        }
         let prefix = Bytes::from(self.key_codec.dir_scan_prefix(dir_id));
         let seek_to = self
             .key_codec
@@ -288,6 +299,70 @@ impl DirectoryStore {
         )))
     }
 
+    /// Directory listing for a branch codec. The DirScan projection is the
+    /// root view's listing index (volume-global and cookie-ordered — parent
+    /// and branch cookies are allocated from independent counters and cannot
+    /// be merged), so a branch lists the scoped DirEntry rows instead: the
+    /// database's merged branch scan ([`Db::scan_prefix`]) is what makes the
+    /// parent's entries visible, the branch's own entries appear, and
+    /// branch-deleted (tombstoned) parent entries stay hidden. Entries come
+    /// back name-ordered (the DirEntry key suffix), without embedded inodes.
+    ///
+    /// Cookies are synthetic positions (`COOKIE_FIRST_ENTRY + index`) rather
+    /// than the stored per-scope cookies: they are unique and monotonic
+    /// within one listing, which is what readdir pagination needs, but they
+    /// are only stable for a static directory image.
+    async fn list_branch_entries(
+        &self,
+        dir_id: InodeId,
+        skip: u64,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<DirEntryInfo, FsError>> + Send + '_>>, FsError>
+    {
+        let prefix = Bytes::from(self.key_codec.dir_entry_prefix(dir_id));
+        let iter = self
+            .db
+            .scan_prefix(prefix.clone(), None, 256 * 1024)
+            .await
+            .map_err(|_| FsError::IoError)?;
+
+        Ok(Box::pin(futures::stream::unfold(
+            (iter, prefix, 0u64),
+            move |(mut iter, prefix, mut position)| async move {
+                loop {
+                    match iter.next().await {
+                        Some(Ok((key, value))) => {
+                            let current = position;
+                            position += 1;
+                            if current < skip {
+                                continue;
+                            }
+                            if !key.starts_with(prefix.as_ref()) {
+                                return Some((Err(FsError::InvalidData), (iter, prefix, position)));
+                            }
+                            let name = key[prefix.len()..].to_vec();
+                            return Some((
+                                match KeyCodec::decode_dir_entry(&value) {
+                                    Ok((inode_id, _stored_cookie)) => Ok(DirEntryInfo {
+                                        name,
+                                        inode_id,
+                                        cookie: COOKIE_FIRST_ENTRY + current,
+                                        inode: None,
+                                    }),
+                                    Err(e) => Err(e),
+                                },
+                                (iter, prefix, position),
+                            ));
+                        }
+                        Some(Err(_)) => {
+                            return Some((Err(FsError::IoError), (iter, prefix, position)));
+                        }
+                        None => return None,
+                    }
+                }
+            },
+        )))
+    }
+
     /// Add a directory entry.
     /// If `inode` is provided, it will be embedded in the scan entry (for nlink=1 entries).
     /// If `inode` is None, only a reference is stored (for hardlinked entries).
@@ -304,16 +379,22 @@ impl DirectoryStore {
         txn.put_bytes(&entry_key, KeyCodec::encode_dir_entry(entry_id, cookie));
         txn.invalidate_cached_directory_entry(dir_id, Bytes::copy_from_slice(name));
 
-        let scan_value = match inode {
-            Some(inode) => DirScanValueRef::WithInode {
-                inode_id: entry_id,
-                inode,
-            },
-            None => DirScanValueRef::Reference { inode_id: entry_id },
-        };
+        // The DirScan projection is the root view's listing index: its kind
+        // is volume-global, so a branch writing it would pollute the parent's
+        // projection. Branch listings read the scoped DirEntry rows through
+        // the merged scan instead (see `list_branch_entries`).
+        if self.key_codec.branch().is_root() {
+            let scan_value = match inode {
+                Some(inode) => DirScanValueRef::WithInode {
+                    inode_id: entry_id,
+                    inode,
+                },
+                None => DirScanValueRef::Reference { inode_id: entry_id },
+            };
 
-        let scan_key = self.key_codec.dir_scan_key(dir_id, cookie);
-        txn.put_bytes(&scan_key, encode_dir_scan_value(name, &scan_value));
+            let scan_key = self.key_codec.dir_scan_key(dir_id, cookie);
+            txn.put_bytes(&scan_key, encode_dir_scan_value(name, &scan_value));
+        }
     }
 
     pub fn unlink_entry(&self, txn: &mut Transaction, dir_id: InodeId, name: &[u8], cookie: u64) {
@@ -321,8 +402,13 @@ impl DirectoryStore {
         txn.delete_bytes(&entry_key);
         txn.invalidate_cached_directory_entry(dir_id, Bytes::copy_from_slice(name));
 
-        let scan_key = self.key_codec.dir_scan_key(dir_id, cookie);
-        txn.delete_bytes(&scan_key);
+        // Root only (see `add`): on a branch this delete would really delete
+        // the parent's projection row; the branch's DirEntry delete already
+        // hides the entry from the branch's merged listing.
+        if self.key_codec.branch().is_root() {
+            let scan_key = self.key_codec.dir_scan_key(dir_id, cookie);
+            txn.delete_bytes(&scan_key);
+        }
     }
 
     pub fn delete_directory(&self, txn: &mut Transaction, dir_id: InodeId) {
@@ -369,6 +455,11 @@ impl DirectoryStore {
         inode_id: InodeId,
         inode: &Inode,
     ) -> Result<(), FsError> {
+        // Root only (see `add`): branches maintain no DirScan projection;
+        // their listings resolve each entry's inode by point read.
+        if !self.key_codec.branch().is_root() {
+            return Ok(());
+        }
         let (_, cookie) = self.get_entry_with_cookie(dir_id, name).await?;
 
         let scan_value = DirScanValueRef::WithInode { inode_id, inode };
@@ -387,6 +478,10 @@ impl DirectoryStore {
         name: &[u8],
         inode_id: InodeId,
     ) -> Result<(), FsError> {
+        // Root only (see `add`): branches maintain no DirScan projection.
+        if !self.key_codec.branch().is_root() {
+            return Ok(());
+        }
         let (_, cookie) = self.get_entry_with_cookie(dir_id, name).await?;
         let scan_value = DirScanValueRef::Reference { inode_id };
         let scan_key = self.key_codec.dir_scan_key(dir_id, cookie);

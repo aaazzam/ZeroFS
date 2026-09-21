@@ -54,6 +54,50 @@ impl ZeroFS {
         .await
     }
 
+    /// Thin no-lease constructor for a basin-branch view of a volume whose
+    /// slatedb handle the caller already holds (see `try_new_for_branch`).
+    /// Tests build the root filesystem over the same handle with
+    /// [`Self::new_with_slatedb`] and the branch filesystem with this.
+    ///
+    /// `segment_epoch` overrides the segment writer epoch: two filesystems
+    /// sharing ONE slatedb open (only possible in tests — production fencing
+    /// gives each serving process its own epoch) would otherwise mint the
+    /// same `(epoch, counter)` segids and collide on `segments/` object keys.
+    /// Tests that write data through both filesystems must give the branch
+    /// its own epoch; metadata-only tests may pass `None`.
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn new_with_slatedb_for_branch(
+        slatedb: SlateDbHandle,
+        branch: crate::fs::key_codec::BranchId,
+        max_bytes: u64,
+        metrics_recorder: Option<Arc<DefaultMetricsRecorder>>,
+        sync_writes: bool,
+        object_store: Arc<dyn slatedb::object_store::ObjectStore>,
+        segment_codec: FrameCodec,
+        segment_epoch: Option<u64>,
+    ) -> anyhow::Result<Self> {
+        Self::try_new_for_branch(
+            slatedb,
+            max_bytes,
+            metrics_recorder,
+            sync_writes,
+            false,
+            None,
+            None,
+            Arc::new(crate::dedup::DedupCache::new()),
+            None, // single-node / test: no HA coverage proof, always regenerate
+            ObjectTracer::new(),
+            object_store,
+            segment_codec,
+            None,
+            None,
+            branch,
+            segment_epoch,
+        )
+        .await
+    }
+
     /// Construct the filesystem over an opened slatedb handle, with optional
     /// HA lease, replication, and takeover-lineage state.
     #[allow(clippy::too_many_arguments)]
@@ -74,10 +118,62 @@ impl ZeroFS {
             seal_threshold_override: Option<usize>,
             fork_base_epoch: Option<u64>,
         ) -> anyhow::Result<Self> {
+        Self::try_new_for_branch(
+            slatedb,
+            max_bytes,
+            metrics_recorder,
+            sync_writes,
+            ignore_fsync,
+            lease,
+            replicator,
+            dedup,
+            lineage_proof,
+            object_tracer,
+            object_store,
+            segment_codec,
+            seal_threshold_override,
+            fork_base_epoch,
+            crate::fs::key_codec::BranchId::ROOT,
+            None,
+        )
+        .await
+    }
+
+    /// `try_new` restricted to a basin branch's view of the volume (see
+    /// [`crate::db::Db::with_branch`]): keys are built and resolved through
+    /// the branch's codec, so writes land in the branch's key ranges and
+    /// deletes of parent-visible keys become branch tombstones.
+    /// [`crate::fs::key_codec::BranchId::ROOT`] is exactly `try_new`.
+    ///
+    /// `segment_epoch_override` replaces the segment writer epoch the store
+    /// mints segids from. Production passes `None` (the manifest's writer
+    /// epoch is correct and unique per serving process); tests sharing one
+    /// slatedb open between a root and a branch filesystem use it to keep
+    /// their segment object keys disjoint.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn try_new_for_branch(
+        slatedb: SlateDbHandle,
+        max_bytes: u64,
+        metrics_recorder: Option<Arc<DefaultMetricsRecorder>>,
+        sync_writes: bool,
+        ignore_fsync: bool,
+        lease: Option<Arc<crate::replication::Lease>>,
+        replicator: Option<crate::replication::Replicator>,
+        dedup: Arc<crate::dedup::DedupCache>,
+        // Present only when takeover reconciliation produced an epoch-bound proof.
+        lineage_proof: Option<LineageProof>,
+            object_tracer: ObjectTracer,
+            object_store: Arc<dyn slatedb::object_store::ObjectStore>,
+            segment_codec: FrameCodec,
+            seal_threshold_override: Option<usize>,
+            fork_base_epoch: Option<u64>,
+            branch: crate::fs::key_codec::BranchId,
+            segment_epoch_override: Option<u64>,
+        ) -> anyhow::Result<Self> {
         // The expiry reaper may already be running from CLI setup.
         dedup.start_expiry_reaper();
         let lock_manager = Arc::new(KeyedLockManager::new());
-        let key_codec = Arc::new(KeyCodec::new());
+        let key_codec = Arc::new(KeyCodec::for_branch(branch));
         let ha_writer = lease.is_some();
 
         // The data-db `writer_epoch` (monotonic object-store CAS, bumped on every
@@ -94,13 +190,13 @@ impl ZeroFS {
 
         let db = Arc::new(match slatedb {
             SlateDbHandle::ReadWrite(db) => {
-                let db = Db::new(db, metrics_recorder);
+                let db = Db::new(db, metrics_recorder).with_branch(branch);
                 match lease {
                     Some(lease) => db.with_lease(lease),
                     None => db,
                 }
             }
-            SlateDbHandle::ReadOnly(reader) => Db::new_read_only(reader),
+            SlateDbHandle::ReadOnly(reader) => Db::new_read_only(reader).with_branch(branch),
         });
 
         let counter_key = key_codec.system_counter_key();
@@ -166,7 +262,11 @@ impl ZeroFS {
         // without keeping its own commit worker alive.
         let (write_coordinator, pending_write_coordinator) =
             WriteCoordinator::channel(next_inode_id);
-        let segment_store = SegmentStore::new(object_store, segment_codec, writer_epoch);
+        let segment_store = SegmentStore::new(
+            object_store,
+            segment_codec,
+            segment_epoch_override.unwrap_or(writer_epoch),
+        );
         // Forks own only their base epoch onward; the SegmentPathRouter
         // underneath resolves older (ancestor) epochs for reads.
         let segment_store = Arc::new(match fork_base_epoch {

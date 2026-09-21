@@ -5,7 +5,7 @@ use bytes::Bytes;
 
 // Key layout for the underlying LSM.
 //
-// Every key is [b"meta" | b"extent"] + [kind: 1] + [id: 8] + ...
+// Every key is [b"meta" | b"extent"] + [kind: 1] + [branch?: 4] + [id: 8] + ...
 //
 // The leading domain prefix is what slatedb's segment extractor routes on:
 // all metadata kinds land in the `b"meta"` segment, bulk extent pointers in
@@ -33,7 +33,40 @@ use bytes::Bytes;
 //   0x0A FORK_LINEAGE  single record holding this volume's fork lineage (present only in forks)
 //   0x0B FORK_REGISTRY per-fork registry entry, name-keyed (present only in parents of forks)
 //   0x0C FLUSH_TIME    flush-time index: manifest_id -> flush wall-clock time, one row per flush
+//   0x0D BRANCH_TOMBSTONE branch-delete marker: shadows a parent-visible key in one branch
+//   0x0E BRANCH        branch registry entry, name-keyed; value is versioned JSON {id, created_at}
 //   0xFE EXTENT        bulk file data — the only kind in the extent segment
+//
+// # Branch dimension (basin branches)
+//
+// A basin branch is a fork-like namespace *inside* this volume's LSM: branch
+// creation is O(1) metadata (see [`crate::branch`]), and a branch's reads fall
+// back to the parent (branch 0, the volume root) for keys the branch never
+// wrote (see [`crate::db::Db::with_branch`]). For a [`KeyCodec`] built with
+// [`KeyCodec::for_branch`] and a non-root [`BranchId`], keys of the
+// *branch-scoped* kinds gain a 4-byte big-endian branch id immediately after
+// the kind byte:
+//
+// ```text
+// branch 0 (unchanged layout):  domain || kind || suffix
+// branch > 0, scoped kinds:     domain || kind || branch: u32 BE || suffix
+// ```
+//
+// Branch 0 emits exactly the historical layout, so existing volumes are
+// byte-compatible with no format bump. The branch id sits after domain+kind
+// (not first) so the segment extractor's domain routing is unchanged and every
+// per-kind scan stays a `[kind || branch]` prefix scan per branch.
+//
+// Scoped vs. unscoped kinds:
+//   - Scoped (branch id present for branch > 0): INODE, DIR_ENTRY, DIR_COOKIE,
+//     TOMBSTONE, ORPHAN, SEGCOUNT, and EXTENT (the extent domain). These carry
+//     per-branch namespace and segment-ownership state.
+//   - Unscoped (global layout for every branch): STATS, SYSTEM, DIR_SCAN,
+//     FORK_LINEAGE, FORK_REGISTRY, FLUSH_TIME, BRANCH_TOMBSTONE, and BRANCH.
+//     These are volume-level state (counters, config, fork/branch bookkeeping).
+//     BRANCH_TOMBSTONE keys embed the branch id they shadow for as key payload
+//     (`meta || BRANCH_TOMBSTONE || branch || shadowed kind || shadowed
+//     suffix`), so the kind itself needs no branch dimension.
 
 const PREFIX_INODE: u8 = 0x01;
 const PREFIX_DIR_ENTRY: u8 = 0x02;
@@ -47,6 +80,8 @@ const PREFIX_SEGCOUNT: u8 = 0x09;
 const PREFIX_FORK_LINEAGE: u8 = 0x0A;
 const PREFIX_FORK_REGISTRY: u8 = 0x0B;
 const PREFIX_FLUSH_TIME: u8 = 0x0C;
+const PREFIX_BRANCH_TOMBSTONE: u8 = 0x0D;
+const PREFIX_BRANCH: u8 = 0x0E;
 const PREFIX_EXTENT: u8 = 0xFE;
 
 const SYSTEM_COUNTER_KEY: &[u8; 6] = b"meta\x06\x01";
@@ -68,13 +103,27 @@ const SYSTEM_TAINT_KEY: &[u8; 6] = b"meta\x06\x04";
 // Wall-clock epoch-seconds (u64 LE via encode_u64) of the last completed slow
 // orphan sweep.
 const SYSTEM_ORPHAN_SWEEP_KEY: &[u8; 6] = b"meta\x06\x05";
+// Basin-branch id allocator: the highest branch id handed out so far (u64 LE
+// via encode_u64; only the u32 range is used). Global layout, volume-level: it
+// lives on branch 0 like every other System row. Never decremented, so ids
+// stay unique even across branch deletion and re-creation.
+const SYSTEM_BRANCH_COUNTER_KEY: &[u8; 6] = b"meta\x06\x06";
 
 /// Version byte preceding the timestamp payload of every flush-time index
 /// value (see [`KeyCodec::encode_flush_time`]). Durable data: never reuse a
 /// lower number with a different layout.
 const FLUSH_TIME_RECORD_VERSION: u8 = 1;
 
+/// Version byte used as the entire value of every branch-tombstone row (see
+/// [`KeyCodec::branch_tombstone_key`]). The row's *presence* is the signal —
+/// "this branch deleted the parent-visible key" — so the value is just a
+/// version byte, future-proofing the payload the same way as the fork records.
+const BRANCH_TOMBSTONE_RECORD_VERSION: u8 = 1;
+
 const U64_SIZE: usize = std::mem::size_of::<u64>();
+
+/// Bytes the branch id contributes to a scoped key under a non-root branch.
+const BRANCH_ID_SIZE: usize = std::mem::size_of::<u32>();
 
 /// Domain prefix for any metadata kind.
 pub const META_DOMAIN: &[u8] = b"meta";
@@ -84,35 +133,82 @@ pub const EXTENT_DOMAIN: &[u8] = b"extent";
 const INODE_KEY_SIZE: usize = META_DOMAIN.len() + 1 + U64_SIZE;
 const EXTENT_KEY_SIZE: usize = EXTENT_DOMAIN.len() + 1 + U64_SIZE * 2;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct InodeKey([u8; INODE_KEY_SIZE]);
+const MAX_INODE_KEY_SIZE: usize = INODE_KEY_SIZE + BRANCH_ID_SIZE;
+const MAX_EXTENT_KEY_SIZE: usize = EXTENT_KEY_SIZE + BRANCH_ID_SIZE;
 
-impl AsRef<[u8]> for InodeKey {
-    fn as_ref(&self) -> &[u8] {
-        &self.0
+/// Identifies a basin branch within a volume's LSM. `BranchId(0)` is the
+/// volume root: it uses the historical key layout exactly (no branch bytes),
+/// so pre-branch volumes are byte-compatible. See the keyspace comment at the
+/// top of this file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct BranchId(pub u32);
+
+impl BranchId {
+    /// The volume root: the implicit branch every pre-branch volume consists of.
+    pub const ROOT: BranchId = BranchId(0);
+
+    pub fn is_root(self) -> bool {
+        self == Self::ROOT
     }
 }
 
-impl From<InodeKey> for Bytes {
-    fn from(key: InodeKey) -> Self {
-        Self::copy_from_slice(key.as_ref())
-    }
+macro_rules! fixed_key {
+    ($name:ident, $max:ident) => {
+        /// Equality, ordering, and hashing act on the key bytes, not the
+        /// fixed-size backing array (whose padding is not part of the key).
+        #[derive(Debug, Clone, Copy)]
+        pub struct $name {
+            bytes: [u8; $max],
+            len: usize,
+        }
+
+        impl $name {
+            fn new(bytes: [u8; $max], len: usize) -> Self {
+                debug_assert!(len <= $max);
+                Self { bytes, len }
+            }
+        }
+
+        impl AsRef<[u8]> for $name {
+            fn as_ref(&self) -> &[u8] {
+                &self.bytes[..self.len]
+            }
+        }
+
+        impl From<$name> for Bytes {
+            fn from(key: $name) -> Self {
+                Self::copy_from_slice(key.as_ref())
+            }
+        }
+
+        impl PartialEq for $name {
+            fn eq(&self, other: &Self) -> bool {
+                self.as_ref() == other.as_ref()
+            }
+        }
+        impl Eq for $name {}
+
+        impl PartialOrd for $name {
+            fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+                Some(self.cmp(other))
+            }
+        }
+        impl Ord for $name {
+            fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+                self.as_ref().cmp(other.as_ref())
+            }
+        }
+
+        impl std::hash::Hash for $name {
+            fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+                self.as_ref().hash(state);
+            }
+        }
+    };
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct ExtentKey([u8; EXTENT_KEY_SIZE]);
-
-impl AsRef<[u8]> for ExtentKey {
-    fn as_ref(&self) -> &[u8] {
-        &self.0
-    }
-}
-
-impl From<ExtentKey> for Bytes {
-    fn from(key: ExtentKey) -> Self {
-        Self::copy_from_slice(key.as_ref())
-    }
-}
+fixed_key!(InodeKey, MAX_INODE_KEY_SIZE);
+fixed_key!(ExtentKey, MAX_EXTENT_KEY_SIZE);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum KeyPrefix {
@@ -129,6 +225,8 @@ pub enum KeyPrefix {
     ForkLineage,
     ForkRegistry,
     FlushTime,
+    BranchTombstone,
+    Branch,
 }
 
 impl TryFrom<u8> for KeyPrefix {
@@ -149,6 +247,8 @@ impl TryFrom<u8> for KeyPrefix {
             PREFIX_FORK_LINEAGE => Ok(Self::ForkLineage),
             PREFIX_FORK_REGISTRY => Ok(Self::ForkRegistry),
             PREFIX_FLUSH_TIME => Ok(Self::FlushTime),
+            PREFIX_BRANCH_TOMBSTONE => Ok(Self::BranchTombstone),
+            PREFIX_BRANCH => Ok(Self::Branch),
             _ => Err(()),
         }
     }
@@ -170,6 +270,8 @@ impl From<KeyPrefix> for u8 {
             KeyPrefix::ForkLineage => PREFIX_FORK_LINEAGE,
             KeyPrefix::ForkRegistry => PREFIX_FORK_REGISTRY,
             KeyPrefix::FlushTime => PREFIX_FLUSH_TIME,
+            KeyPrefix::BranchTombstone => PREFIX_BRANCH_TOMBSTONE,
+            KeyPrefix::Branch => PREFIX_BRANCH,
         }
     }
 }
@@ -190,7 +292,26 @@ impl KeyPrefix {
             Self::ForkLineage => "FORK_LINEAGE",
             Self::ForkRegistry => "FORK_REGISTRY",
             Self::FlushTime => "FLUSH_TIME",
+            Self::BranchTombstone => "BRANCH_TOMBSTONE",
+            Self::Branch => "BRANCH",
         }
+    }
+
+    /// Whether keys of this kind carry the branch-id dimension under a
+    /// non-root branch (see the keyspace comment at the top of this file).
+    /// Unscoped kinds are volume-level state and keep the global layout for
+    /// every branch.
+    pub fn is_scoped(self) -> bool {
+        matches!(
+            self,
+            Self::Inode
+                | Self::DirEntry
+                | Self::DirCookie
+                | Self::Tombstone
+                | Self::Orphan
+                | Self::SegCount
+                | Self::Extent
+        )
     }
 
     fn domain(self) -> &'static [u8] {
@@ -209,15 +330,33 @@ pub enum ParsedKey {
     Unknown,
 }
 
-/// Per-volume key encoder/decoder. Stateless: every volume uses the segmented
-/// layout, a `b"meta"`/`b"extent"` domain prefix that the slatedb segment
-/// extractor routes on.
-#[derive(Debug, Clone, Default)]
-pub struct KeyCodec;
+/// Per-volume key encoder/decoder. Every volume uses the segmented layout, a
+/// `b"meta"`/`b"extent"` domain prefix that the slatedb segment extractor
+/// routes on. The only state is the [`BranchId`]: [`KeyCodec::new`] builds the
+/// root-branch codec (today's exact layout); [`KeyCodec::for_branch`] builds a
+/// codec whose scoped-kind keys embed the branch id (see the keyspace comment
+/// at the top of this file).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct KeyCodec {
+    branch: BranchId,
+}
 
 impl KeyCodec {
     pub fn new() -> Self {
-        Self
+        Self {
+            branch: BranchId::ROOT,
+        }
+    }
+
+    /// Codec for a basin branch. [`BranchId::ROOT`] produces the exact same
+    /// layout as [`KeyCodec::new`]; any other branch inserts
+    /// `branch: u32 BE` after the kind byte of every scoped-kind key.
+    pub fn for_branch(branch: BranchId) -> Self {
+        Self { branch }
+    }
+
+    pub fn branch(&self) -> BranchId {
+        self.branch
     }
 
     /// Number of bytes the domain prefix contributes for `prefix`.
@@ -230,27 +369,41 @@ impl KeyCodec {
         self.domain_len(prefix)
     }
 
+    /// Bytes the branch id contributes to keys of `prefix` under this codec:
+    /// 4 for scoped kinds under a non-root branch, 0 otherwise.
+    fn branch_bytes(&self, prefix: KeyPrefix) -> usize {
+        if prefix.is_scoped() && !self.branch.is_root() {
+            BRANCH_ID_SIZE
+        } else {
+            0
+        }
+    }
+
     /// Byte offset where the id portion lives for `prefix`. Used by raw
     /// key consumers (tests, verifiers) that need to slice key bytes
     /// without going through a typed parse_*.
     pub fn id_offset(&self, prefix: KeyPrefix) -> usize {
-        self.kind_offset(prefix) + 1
+        self.kind_offset(prefix) + 1 + self.branch_bytes(prefix)
     }
 
-    /// Push the domain prefix (if any) plus the kind byte onto `key`.
+    /// Push the domain prefix (if any) plus the kind byte onto `key`,
+    /// followed by the branch id for scoped kinds under a non-root branch.
     fn push_prefix(&self, key: &mut Vec<u8>, prefix: KeyPrefix) {
         key.extend_from_slice(prefix.domain());
         key.push(u8::from(prefix));
+        if self.branch_bytes(prefix) == BRANCH_ID_SIZE {
+            key.extend_from_slice(&self.branch.0.to_be_bytes());
+        }
     }
 
     /// Total bytes in a complete inode key.
     pub fn inode_key_size(&self) -> usize {
-        INODE_KEY_SIZE
+        INODE_KEY_SIZE + self.branch_bytes(KeyPrefix::Inode)
     }
 
     /// Total bytes in a complete extent key.
     pub fn extent_key_size(&self) -> usize {
-        EXTENT_KEY_SIZE
+        EXTENT_KEY_SIZE + self.branch_bytes(KeyPrefix::Extent)
     }
 
     /// Total bytes in a complete tombstone key.
@@ -264,21 +417,31 @@ impl KeyCodec {
     }
 
     pub fn inode_key(&self, inode_id: InodeId) -> InodeKey {
-        let mut key = [0; INODE_KEY_SIZE];
-        key[..META_DOMAIN.len()].copy_from_slice(META_DOMAIN);
-        key[self.kind_offset(KeyPrefix::Inode)] = PREFIX_INODE;
-        key[self.id_offset(KeyPrefix::Inode)..].copy_from_slice(&inode_id.to_be_bytes());
-        InodeKey(key)
+        let mut bytes = [0; MAX_INODE_KEY_SIZE];
+        bytes[..META_DOMAIN.len()].copy_from_slice(META_DOMAIN);
+        bytes[self.kind_offset(KeyPrefix::Inode)] = PREFIX_INODE;
+        if self.branch_bytes(KeyPrefix::Inode) == BRANCH_ID_SIZE {
+            let off = self.kind_offset(KeyPrefix::Inode) + 1;
+            bytes[off..off + BRANCH_ID_SIZE].copy_from_slice(&self.branch.0.to_be_bytes());
+        }
+        let id_offset = self.id_offset(KeyPrefix::Inode);
+        bytes[id_offset..id_offset + U64_SIZE].copy_from_slice(&inode_id.to_be_bytes());
+        InodeKey::new(bytes, id_offset + U64_SIZE)
     }
 
     pub fn extent_key(&self, inode_id: InodeId, extent_index: u64) -> ExtentKey {
-        let mut key = [0; EXTENT_KEY_SIZE];
-        key[..EXTENT_DOMAIN.len()].copy_from_slice(EXTENT_DOMAIN);
-        key[self.kind_offset(KeyPrefix::Extent)] = PREFIX_EXTENT;
+        let mut bytes = [0; MAX_EXTENT_KEY_SIZE];
+        bytes[..EXTENT_DOMAIN.len()].copy_from_slice(EXTENT_DOMAIN);
+        bytes[self.kind_offset(KeyPrefix::Extent)] = PREFIX_EXTENT;
+        if self.branch_bytes(KeyPrefix::Extent) == BRANCH_ID_SIZE {
+            let off = self.kind_offset(KeyPrefix::Extent) + 1;
+            bytes[off..off + BRANCH_ID_SIZE].copy_from_slice(&self.branch.0.to_be_bytes());
+        }
         let id_offset = self.id_offset(KeyPrefix::Extent);
-        key[id_offset..id_offset + U64_SIZE].copy_from_slice(&inode_id.to_be_bytes());
-        key[id_offset + U64_SIZE..].copy_from_slice(&extent_index.to_be_bytes());
-        ExtentKey(key)
+        bytes[id_offset..id_offset + U64_SIZE].copy_from_slice(&inode_id.to_be_bytes());
+        bytes[id_offset + U64_SIZE..id_offset + U64_SIZE * 2]
+            .copy_from_slice(&extent_index.to_be_bytes());
+        ExtentKey::new(bytes, id_offset + U64_SIZE * 2)
     }
 
     pub fn parse_extent_key(&self, key: &[u8]) -> Option<u64> {
@@ -346,6 +509,32 @@ impl KeyCodec {
     /// Half-open `[start, end)` covering every segcount key, for a full scan.
     pub fn segcount_prefix_range(&self) -> (Bytes, Bytes) {
         self.prefix_range(KeyPrefix::SegCount)
+    }
+
+    /// `(epoch, counter)` of a segcount key in ANY branch's layout — root
+    /// (`kind || epoch || counter`) or branch-qualified (`kind || branch ||
+    /// epoch || counter`); the embedded branch id is skipped, not validated.
+    /// Volume-wide maintenance that must see every scope's counters at once
+    /// (the orphan sweep's liveness census) uses this; per-scope scans use
+    /// [`Self::parse_segcount_key`]. Suffix length disambiguates the layouts:
+    /// branch-qualified keys are exactly [`BRANCH_ID_SIZE`] bytes longer.
+    pub fn parse_any_segcount_key(key: &[u8]) -> Option<(u64, u64)> {
+        let root = KeyCodec::new();
+        let base = root.id_offset(KeyPrefix::SegCount);
+        if !key.starts_with(META_DOMAIN)
+            || key.get(root.kind_offset(KeyPrefix::SegCount)) != Some(&PREFIX_SEGCOUNT)
+        {
+            return None;
+        }
+        let suffix = key.get(base..)?;
+        let ids = match suffix.len() {
+            n if n == U64_SIZE * 2 => suffix,
+            n if n == BRANCH_ID_SIZE + U64_SIZE * 2 => &suffix[BRANCH_ID_SIZE..],
+            _ => return None,
+        };
+        let epoch = u64::from_be_bytes(ids[..U64_SIZE].try_into().ok()?);
+        let counter = u64::from_be_bytes(ids[U64_SIZE..].try_into().ok()?);
+        Some((epoch, counter))
     }
 
     /// Key for this volume's own fork-lineage record: a single record per
@@ -447,6 +636,17 @@ impl KeyCodec {
         key.extend_from_slice(&dir_id.to_be_bytes());
         key.extend_from_slice(name);
         Bytes::from(key)
+    }
+
+    /// Prefix covering every dir-entry of `dir_id`, ordered by name, for
+    /// `scan_prefix`. Branch codecs embed the branch id, so a branch's
+    /// dir-entry prefix scan sees only its own rows unless the database
+    /// merges scopes (see [`crate::db::Db::scan_prefix`]).
+    pub fn dir_entry_prefix(&self, dir_id: InodeId) -> Vec<u8> {
+        let mut prefix = Vec::with_capacity(self.id_offset(KeyPrefix::DirEntry) + U64_SIZE);
+        self.push_prefix(&mut prefix, KeyPrefix::DirEntry);
+        prefix.extend_from_slice(&dir_id.to_be_bytes());
+        prefix
     }
 
     pub fn dir_scan_key(&self, dir_id: InodeId, cookie: u64) -> Bytes {
@@ -684,8 +884,10 @@ impl KeyCodec {
 
     /// Decode the kind byte from a stored key. Returns `None` if the key
     /// is too short, lacks the expected domain prefix, or carries a kind
-    /// byte we don't recognize.
-    fn peek_kind(&self, key: &[u8]) -> Option<KeyPrefix> {
+    /// byte we don't recognize. Layout-independent: only the domain and
+    /// kind bytes are read, so any branch's codec can decode any branch's
+    /// keys.
+    pub(crate) fn peek_kind(&self, key: &[u8]) -> Option<KeyPrefix> {
         // Dispatch on the leading domain prefix to pick which kind byte to read.
         if let Some(rest) = key.strip_prefix(EXTENT_DOMAIN) {
             let kind = KeyPrefix::try_from(*rest.first()?).ok()?;
@@ -745,18 +947,254 @@ impl KeyCodec {
         Ok(u64::from_le_bytes(bytes))
     }
 
-    /// Half-open `[start, end)` range covering every key of `prefix`.
-    /// `end` is the prefix bytes followed by the kind-byte successor, so the
-    /// range stays within the domain segment.
+    /// Half-open `[start, end)` range covering every key of `prefix` *under
+    /// this codec's branch*. For a non-root branch and a scoped kind the
+    /// range brackets exactly this branch's slice of the kind (`kind ||
+    /// branch` up to `kind || branch + 1`); for the root branch or unscoped
+    /// kinds it is the whole kind, exactly as before the branch dimension
+    /// existed (`end` is the prefix bytes with the kind byte incremented, so
+    /// the range stays within the domain segment).
     pub fn prefix_range(&self, prefix: KeyPrefix) -> (Bytes, Bytes) {
         let mut start = Vec::with_capacity(self.id_offset(prefix));
         self.push_prefix(&mut start, prefix);
         let mut end = start.clone();
-        // The kind byte we just pushed is at `start.len() - 1`. The end of
-        // the range is the same bytes with that kind byte incremented by 1.
-        let last_idx = end.len() - 1;
-        end[last_idx] += 1;
+        if self.branch_bytes(prefix) == BRANCH_ID_SIZE && self.branch.0 < u32::MAX {
+            // End at this branch's successor: the range covers this branch's
+            // keys and no sibling branch's. The kind byte sits at
+            // `kind_offset`; the 4 branch bytes follow it.
+            let branch_off = self.kind_offset(prefix) + 1;
+            end[branch_off..branch_off + BRANCH_ID_SIZE]
+                .copy_from_slice(&(self.branch.0 + 1).to_be_bytes());
+        } else {
+            // The kind byte we just pushed is at `kind_offset`. The end of
+            // the range is the same bytes with that kind byte incremented by
+            // 1 (and no branch bytes, for unscoped kinds and the root).
+            end.truncate(self.kind_offset(prefix) + 1);
+            let last_idx = end.len() - 1;
+            end[last_idx] += 1;
+        }
         (Bytes::from(start), Bytes::from(end))
+    }
+
+    /// Key marking that this codec's branch deleted the parent-visible key
+    /// `shadowed` (a full scoped key built by this same branch codec):
+    /// `meta || BRANCH_TOMBSTONE || branch || shadowed kind || shadowed
+    /// suffix`. Presence of the row is the whole signal; the value is
+    /// [`Self::branch_tombstone_value`]. Returns `None` if `shadowed` is not
+    /// a well-formed scoped key of this branch.
+    pub fn branch_tombstone_key(&self, shadowed: &[u8]) -> Option<Bytes> {
+        let (kind, suffix) = self.split_scoped_key(shadowed)?;
+        let mut key =
+            Vec::with_capacity(META_DOMAIN.len() + 1 + BRANCH_ID_SIZE + 1 + suffix.len());
+        key.extend_from_slice(META_DOMAIN);
+        key.push(PREFIX_BRANCH_TOMBSTONE);
+        key.extend_from_slice(&self.branch.0.to_be_bytes());
+        key.push(u8::from(kind));
+        key.extend_from_slice(suffix);
+        Some(Bytes::from(key))
+    }
+
+    /// Value written with every branch-tombstone row: a bare version byte
+    /// (presence is the signal; see [`BRANCH_TOMBSTONE_RECORD_VERSION`]).
+    pub fn branch_tombstone_value() -> Bytes {
+        Bytes::from_static(&[BRANCH_TOMBSTONE_RECORD_VERSION])
+    }
+
+    /// Prefix covering this branch's tombstone rows that shadow keys of
+    /// `kind` whose suffix starts with `suffix_prefix` (`meta ||
+    /// BRANCH_TOMBSTONE || branch || kind || suffix_prefix`, mirroring
+    /// [`Self::branch_tombstone_key`]). A merged branch scan prefetches this
+    /// range once to decide which parent-scope rows to suppress, instead of
+    /// a point lookup per candidate row.
+    pub fn branch_tombstone_prefix(&self, kind: KeyPrefix, suffix_prefix: &[u8]) -> Bytes {
+        let mut key =
+            Vec::with_capacity(META_DOMAIN.len() + 1 + BRANCH_ID_SIZE + 1 + suffix_prefix.len());
+        key.extend_from_slice(META_DOMAIN);
+        key.push(PREFIX_BRANCH_TOMBSTONE);
+        key.extend_from_slice(&self.branch.0.to_be_bytes());
+        key.push(u8::from(kind));
+        key.extend_from_slice(suffix_prefix);
+        Bytes::from(key)
+    }
+
+    /// The tombstone-range equivalent of a parent-view scan bound (see
+    /// [`Self::branch_tombstone_prefix`]): the bound's bytes from its kind
+    /// byte onward, re-rooted under this branch's tombstone header. The kind
+    /// byte is copied verbatim, so a bound at `kind + 1` (the exclusive end
+    /// of a whole-kind scan) maps to the end of that kind's tombstone space
+    /// even when `kind + 1` is itself an unscoped or unknown kind. Returns
+    /// `None` on a root codec or a bound outside both domains.
+    pub fn branch_tombstone_bound(&self, parent_bound: &[u8]) -> Option<Bytes> {
+        if self.branch.is_root() {
+            return None;
+        }
+        let from_kind = parent_bound
+            .strip_prefix(META_DOMAIN)
+            .or_else(|| parent_bound.strip_prefix(EXTENT_DOMAIN))?;
+        if from_kind.is_empty() {
+            return None;
+        }
+        let mut key =
+            Vec::with_capacity(META_DOMAIN.len() + 1 + BRANCH_ID_SIZE + from_kind.len());
+        key.extend_from_slice(META_DOMAIN);
+        key.push(PREFIX_BRANCH_TOMBSTONE);
+        key.extend_from_slice(&self.branch.0.to_be_bytes());
+        key.extend_from_slice(from_kind);
+        Some(Bytes::from(key))
+    }
+
+    /// Half-open `[start, end)` covering every BRANCH_TOMBSTONE row of this
+    /// codec's branch (`meta || BRANCH_TOMBSTONE || branch` up to `branch +
+    /// 1`), for dropping them when the branch itself is deleted. Returns
+    /// `None` on a root codec: the root has no branch-tombstone rows, and the
+    /// whole-kind range would cover OTHER branches' rows.
+    pub fn branch_tombstone_range(&self) -> Option<(Bytes, Bytes)> {
+        if self.branch.is_root() {
+            return None;
+        }
+        let mut start =
+            Vec::with_capacity(META_DOMAIN.len() + 1 + BRANCH_ID_SIZE);
+        start.extend_from_slice(META_DOMAIN);
+        start.push(PREFIX_BRANCH_TOMBSTONE);
+        start.extend_from_slice(&self.branch.0.to_be_bytes());
+        let mut end = start.clone();
+        if self.branch.0 < u32::MAX {
+            let branch_off = META_DOMAIN.len() + 1;
+            end[branch_off..branch_off + BRANCH_ID_SIZE]
+                .copy_from_slice(&(self.branch.0 + 1).to_be_bytes());
+        } else {
+            // u32::MAX has no successor; bracket with the next kind byte.
+            end.truncate(META_DOMAIN.len() + 1);
+            let last_idx = end.len() - 1;
+            end[last_idx] += 1;
+        }
+        Some((Bytes::from(start), Bytes::from(end)))
+    }
+
+    /// Split a branch-tombstone row's key into the shadowed kind and suffix
+    /// (the inverse of the key half of [`Self::branch_tombstone_key`]).
+    /// Returns `None` for another branch's rows or malformed keys.
+    pub fn parse_branch_tombstone_key<'a>(
+        &self,
+        key: &'a [u8],
+    ) -> Option<(KeyPrefix, &'a [u8])> {
+        let rest = key.strip_prefix(META_DOMAIN)?;
+        let (&kind_byte, rest) = rest.split_first()?;
+        if kind_byte != PREFIX_BRANCH_TOMBSTONE {
+            return None;
+        }
+        let branch: [u8; BRANCH_ID_SIZE] = rest.get(..BRANCH_ID_SIZE)?.try_into().ok()?;
+        if BranchId(u32::from_be_bytes(branch)) != self.branch {
+            return None;
+        }
+        let rest = &rest[BRANCH_ID_SIZE..];
+        let (&shadowed_kind, suffix) = rest.split_first()?;
+        let shadowed_kind = KeyPrefix::try_from(shadowed_kind).ok()?;
+        Some((shadowed_kind, suffix))
+    }
+
+    /// The suffix of a scoped key as this codec sees it: the bytes after
+    /// `domain || kind` for the root codec, or `domain || kind || branch` for
+    /// a non-root codec (with the embedded branch id validated). This is the
+    /// comparator key for merged branch scans: a parent row and a branch row
+    /// name the same logical entry exactly when their suffixes are equal.
+    /// Returns `None` for unrecognized or unscoped keys and for another
+    /// branch's keys.
+    pub fn scoped_suffix<'a>(&self, key: &'a [u8]) -> Option<&'a [u8]> {
+        let kind = self.peek_kind(key)?;
+        if !kind.is_scoped() {
+            return None;
+        }
+        if self.branch_bytes(kind) == BRANCH_ID_SIZE {
+            let branch_off = self.kind_offset(kind) + 1;
+            let branch: [u8; BRANCH_ID_SIZE] = key
+                .get(branch_off..branch_off + BRANCH_ID_SIZE)?
+                .try_into()
+                .ok()?;
+            if BranchId(u32::from_be_bytes(branch)) != self.branch {
+                return None;
+            }
+        }
+        key.get(self.id_offset(kind)..)
+    }
+
+    /// The branch-layout form of a parent (root-layout) scoped key: the same
+    /// bytes with this codec's branch id inserted after the kind byte — the
+    /// inverse of [`Self::strip_branch`]. Merged branch scans re-key
+    /// surviving parent rows this way so every emitted key parses under the
+    /// branch codec. Returns `None` on a root codec or for unrecognized or
+    /// unscoped keys.
+    pub fn adopt_parent_key(&self, parent: &[u8]) -> Option<Bytes> {
+        if self.branch.is_root() {
+            return None;
+        }
+        let kind = self.peek_kind(parent)?;
+        if !kind.is_scoped() {
+            return None;
+        }
+        let kind_off = self.kind_offset(kind);
+        let mut key = Vec::with_capacity(parent.len() + BRANCH_ID_SIZE);
+        key.extend_from_slice(&parent[..kind_off + 1]);
+        key.extend_from_slice(&self.branch.0.to_be_bytes());
+        key.extend_from_slice(&parent[kind_off + 1..]);
+        Some(Bytes::from(key))
+    }
+
+    /// The parent (root-branch) form of a scoped key built by this branch
+    /// codec: the same bytes with the 4 branch bytes removed. Returns `None`
+    /// for unrecognized, unscoped, root-branch, or other-branch keys — the
+    /// caller must not silently treat those as parent keys.
+    pub fn strip_branch(&self, key: &[u8]) -> Option<Bytes> {
+        let (kind, suffix) = self.split_scoped_key(key)?;
+        let kind_off = self.kind_offset(kind);
+        let mut parent = Vec::with_capacity(key.len() - BRANCH_ID_SIZE);
+        parent.extend_from_slice(&key[..kind_off + 1]);
+        parent.extend_from_slice(suffix);
+        Some(Bytes::from(parent))
+    }
+
+    /// Split a scoped key built by this branch codec into its kind and the
+    /// suffix after the branch id, validating the domain, kind, scope, and
+    /// embedded branch id. The root branch has no branch bytes to split.
+    fn split_scoped_key<'a>(&self, key: &'a [u8]) -> Option<(KeyPrefix, &'a [u8])> {
+        if self.branch.is_root() {
+            return None;
+        }
+        let kind = self.peek_kind(key)?;
+        if !kind.is_scoped() {
+            return None;
+        }
+        let branch_off = self.kind_offset(kind) + 1;
+        let branch_bytes: [u8; BRANCH_ID_SIZE] =
+            key.get(branch_off..branch_off + BRANCH_ID_SIZE)?.try_into().ok()?;
+        if BranchId(u32::from_be_bytes(branch_bytes)) != self.branch {
+            return None;
+        }
+        Some((kind, &key[branch_off + BRANCH_ID_SIZE..]))
+    }
+
+    /// Key for the registry entry naming a basin branch of this volume:
+    /// `meta || BRANCH || name`, global layout (the BRANCH kind is unscoped —
+    /// the registry itself is volume-level state). The value is a versioned
+    /// JSON [`crate::branch::BranchRecord`].
+    pub fn branch_registry_key(&self, name: &str) -> Bytes {
+        let mut key = Vec::with_capacity(self.id_offset(KeyPrefix::Branch) + name.len());
+        self.push_prefix(&mut key, KeyPrefix::Branch);
+        key.extend_from_slice(name.as_bytes());
+        Bytes::from(key)
+    }
+
+    /// Prefix covering every branch-registry entry, for `scan_prefix`.
+    pub fn branch_registry_prefix(&self) -> Bytes {
+        let mut prefix = Vec::with_capacity(self.id_offset(KeyPrefix::Branch));
+        self.push_prefix(&mut prefix, KeyPrefix::Branch);
+        Bytes::from(prefix)
+    }
+
+    /// Key for the branch-id allocator counter (highest id handed out so far,
+    /// a u64 via [`Self::encode_u64`]). Global layout, volume-level state.
+    pub fn branch_counter_key(&self) -> Bytes {
+        Bytes::from_static(SYSTEM_BRANCH_COUNTER_KEY)
     }
 }
 
@@ -1062,6 +1500,480 @@ mod tests {
             ParsedKey::Unknown
         ));
     }
+
+    const TEST_BRANCH: BranchId = BranchId(0x01020304);
+
+    fn branch_codec() -> KeyCodec {
+        KeyCodec::for_branch(TEST_BRANCH)
+    }
+
+    /// Exact expected bytes for `domain || kind || [branch?] || suffix`.
+    fn expected_key(domain: &[u8], kind: u8, branch: Option<BranchId>, suffix: &[u8]) -> Vec<u8> {
+        let mut v = domain.to_vec();
+        v.push(kind);
+        if let Some(branch) = branch {
+            v.extend_from_slice(&branch.0.to_be_bytes());
+        }
+        v.extend_from_slice(suffix);
+        v
+    }
+
+    #[test]
+    fn branch_zero_is_byte_identical_to_the_legacy_layout() {
+        let codec = KeyCodec::new();
+        assert_eq!(codec.branch(), BranchId::ROOT);
+        // The root codec and an explicit `for_branch(ROOT)` codec agree, and
+        // both emit exactly `domain || kind || suffix` with no branch bytes.
+        for c in [KeyCodec::new(), KeyCodec::for_branch(BranchId::ROOT)] {
+            assert_eq!(
+                c.inode_key(7).as_ref(),
+                expected_key(META_DOMAIN, PREFIX_INODE, None, &7u64.to_be_bytes()).as_slice()
+            );
+            assert_eq!(
+                c.extent_key(7, 9).as_ref(),
+                expected_key(
+                    EXTENT_DOMAIN,
+                    PREFIX_EXTENT,
+                    None,
+                    &[7u64.to_be_bytes(), 9u64.to_be_bytes()].concat(),
+                )
+                .as_slice()
+            );
+            assert_eq!(
+                c.segcount_key(3, 4).as_ref(),
+                expected_key(
+                    META_DOMAIN,
+                    PREFIX_SEGCOUNT,
+                    None,
+                    &[3u64.to_be_bytes(), 4u64.to_be_bytes()].concat(),
+                )
+                .as_slice()
+            );
+            assert_eq!(c.inode_key_size(), INODE_KEY_SIZE);
+            assert_eq!(c.extent_key_size(), EXTENT_KEY_SIZE);
+        }
+        assert_eq!(codec, KeyCodec::default());
+    }
+
+    #[test]
+    fn scoped_kinds_embed_the_branch_id_after_the_kind_byte() {
+        let codec = branch_codec();
+        let b = Some(TEST_BRANCH);
+
+        assert_eq!(
+            codec.inode_key(7).as_ref(),
+            expected_key(META_DOMAIN, PREFIX_INODE, b, &7u64.to_be_bytes()).as_slice()
+        );
+        assert_eq!(
+            codec.dir_entry_key(7, b"name").as_ref(),
+            expected_key(
+                META_DOMAIN,
+                PREFIX_DIR_ENTRY,
+                b,
+                &[&7u64.to_be_bytes()[..], b"name"].concat(),
+            )
+            .as_slice()
+        );
+        assert_eq!(
+            codec.dir_cookie_counter_key(7).as_ref(),
+            expected_key(META_DOMAIN, PREFIX_DIR_COOKIE, b, &7u64.to_be_bytes()).as_slice()
+        );
+        assert_eq!(
+            codec.tombstone_key(11, 7).as_ref(),
+            expected_key(
+                META_DOMAIN,
+                PREFIX_TOMBSTONE,
+                b,
+                &[11u64.to_be_bytes(), 7u64.to_be_bytes()].concat(),
+            )
+            .as_slice()
+        );
+        assert_eq!(
+            codec.orphan_key(7).as_ref(),
+            expected_key(META_DOMAIN, PREFIX_ORPHAN, b, &7u64.to_be_bytes()).as_slice()
+        );
+        assert_eq!(
+            codec.segcount_key(3, 4).as_ref(),
+            expected_key(
+                META_DOMAIN,
+                PREFIX_SEGCOUNT,
+                b,
+                &[3u64.to_be_bytes(), 4u64.to_be_bytes()].concat(),
+            )
+            .as_slice()
+        );
+        assert_eq!(
+            codec.extent_key(7, 9).as_ref(),
+            expected_key(
+                EXTENT_DOMAIN,
+                PREFIX_EXTENT,
+                b,
+                &[7u64.to_be_bytes(), 9u64.to_be_bytes()].concat(),
+            )
+            .as_slice()
+        );
+
+        assert_eq!(codec.inode_key_size(), INODE_KEY_SIZE + BRANCH_ID_SIZE);
+        assert_eq!(codec.extent_key_size(), EXTENT_KEY_SIZE + BRANCH_ID_SIZE);
+    }
+
+    #[test]
+    fn unscoped_kinds_keep_the_global_layout_under_a_branch_codec() {
+        let codec = branch_codec();
+        let root = KeyCodec::new();
+
+        // Every unscoped key builder must emit byte-identical keys for the
+        // root codec and a branch codec.
+        assert_eq!(codec.dir_scan_key(7, 42), root.dir_scan_key(7, 42));
+        assert_eq!(
+            codec.dir_scan_resume_key(7, 42),
+            root.dir_scan_resume_key(7, 42)
+        );
+        assert_eq!(codec.stats_shard_key(3), root.stats_shard_key(3));
+        assert_eq!(codec.system_counter_key(), root.system_counter_key());
+        assert_eq!(codec.ha_seqno_key(), root.ha_seqno_key());
+        assert_eq!(codec.lineage_key(), root.lineage_key());
+        assert_eq!(codec.taint_key(), root.taint_key());
+        assert_eq!(
+            codec.last_orphan_sweep_key(),
+            root.last_orphan_sweep_key()
+        );
+        assert_eq!(codec.fork_lineage_key(), root.fork_lineage_key());
+        assert_eq!(codec.fork_registry_key("f"), root.fork_registry_key("f"));
+        assert_eq!(codec.flush_time_key(9), root.flush_time_key(9));
+        assert_eq!(
+            codec.branch_registry_key("b"),
+            root.branch_registry_key("b")
+        );
+        assert_eq!(codec.branch_counter_key(), root.branch_counter_key());
+
+        // None of them grew branch bytes.
+        assert_eq!(
+            codec.dir_scan_key(7, 42).len(),
+            META_DOMAIN.len() + 1 + U64_SIZE * 2
+        );
+        assert_eq!(
+            codec.branch_registry_key("b").as_ref(),
+            expected_key(META_DOMAIN, PREFIX_BRANCH, None, b"b").as_slice()
+        );
+    }
+
+    #[test]
+    fn is_scoped_matches_the_documented_split() {
+        for kind in [
+            KeyPrefix::Inode,
+            KeyPrefix::DirEntry,
+            KeyPrefix::DirCookie,
+            KeyPrefix::Tombstone,
+            KeyPrefix::Orphan,
+            KeyPrefix::SegCount,
+            KeyPrefix::Extent,
+        ] {
+            assert!(kind.is_scoped(), "{kind:?} must be branch-scoped");
+        }
+        for kind in [
+            KeyPrefix::DirScan,
+            KeyPrefix::Stats,
+            KeyPrefix::System,
+            KeyPrefix::ForkLineage,
+            KeyPrefix::ForkRegistry,
+            KeyPrefix::FlushTime,
+            KeyPrefix::BranchTombstone,
+            KeyPrefix::Branch,
+        ] {
+            assert!(!kind.is_scoped(), "{kind:?} must keep the global layout");
+        }
+    }
+
+    #[test]
+    fn id_offset_shifts_only_for_scoped_kinds_under_a_branch() {
+        let root = KeyCodec::new();
+        let codec = branch_codec();
+        for kind in [
+            KeyPrefix::Inode,
+            KeyPrefix::DirEntry,
+            KeyPrefix::DirCookie,
+            KeyPrefix::Tombstone,
+            KeyPrefix::Orphan,
+            KeyPrefix::SegCount,
+            KeyPrefix::Extent,
+        ] {
+            assert_eq!(
+                codec.id_offset(kind),
+                root.id_offset(kind) + BRANCH_ID_SIZE,
+                "{kind:?}"
+            );
+            assert_eq!(codec.kind_offset(kind), root.kind_offset(kind), "{kind:?}");
+        }
+        for kind in [KeyPrefix::DirScan, KeyPrefix::FlushTime, KeyPrefix::Branch] {
+            assert_eq!(codec.id_offset(kind), root.id_offset(kind), "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn strip_branch_recovers_the_parent_key() {
+        let codec = branch_codec();
+        let root = KeyCodec::new();
+
+        for (branched, parent) in [
+            (
+                Bytes::from(codec.inode_key(7)),
+                Bytes::from(root.inode_key(7)),
+            ),
+            (
+                codec.dir_entry_key(7, b"name"),
+                root.dir_entry_key(7, b"name"),
+            ),
+            (codec.segcount_key(3, 4), root.segcount_key(3, 4)),
+            (
+                Bytes::from(codec.extent_key(7, 9)),
+                Bytes::from(root.extent_key(7, 9)),
+            ),
+            (codec.tombstone_key(1, 7), root.tombstone_key(1, 7)),
+            (codec.orphan_key(7), root.orphan_key(7)),
+        ] {
+            assert_eq!(codec.strip_branch(&branched), Some(parent));
+        }
+
+        // Root keys have no branch bytes to strip.
+        assert_eq!(root.strip_branch(&root.inode_key(7).as_ref()), None);
+        // Unscoped keys are never stripped.
+        assert_eq!(codec.strip_branch(&codec.dir_scan_key(7, 42)), None);
+        assert_eq!(codec.strip_branch(&codec.branch_registry_key("b")), None);
+        // Foreign-branch keys are not this branch's to strip.
+        let other = KeyCodec::for_branch(BranchId(0x0A0B0C0D));
+        assert_eq!(codec.strip_branch(other.inode_key(7).as_ref()), None);
+        // Garbage is rejected, never silently mangled.
+        assert_eq!(codec.strip_branch(&[]), None);
+        assert_eq!(codec.strip_branch(&[0xFF; 32]), None);
+        assert_eq!(codec.strip_branch(&codec.inode_key(7).as_ref()[..8]), None);
+    }
+
+    #[test]
+    fn branch_tombstone_key_marks_the_shadowed_parent_key() {
+        let codec = branch_codec();
+        let shadowed = codec.inode_key(7);
+        let tombstone = codec
+            .branch_tombstone_key(shadowed.as_ref())
+            .expect("scoped branch key");
+        assert_eq!(
+            tombstone.as_ref(),
+            expected_key(
+                META_DOMAIN,
+                PREFIX_BRANCH_TOMBSTONE,
+                Some(TEST_BRANCH),
+                &[PREFIX_INODE, 0, 0, 0, 0, 0, 0, 0, 7],
+            )
+            .as_slice()
+        );
+
+        // Extent keys tombstone into the meta domain too; the shadowed kind
+        // byte (0xFE) preserves which domain the shadowed key lived in.
+        let extent_tombstone = codec
+            .branch_tombstone_key(codec.extent_key(7, 9).as_ref())
+            .expect("scoped extent key");
+        assert_eq!(
+            extent_tombstone.as_ref(),
+            expected_key(
+                META_DOMAIN,
+                PREFIX_BRANCH_TOMBSTONE,
+                Some(TEST_BRANCH),
+                &[
+                    &[PREFIX_EXTENT][..],
+                    &7u64.to_be_bytes(),
+                    &9u64.to_be_bytes()
+                ]
+                .concat(),
+            )
+            .as_slice()
+        );
+
+        // The value is a bare version byte; presence is the signal.
+        assert_eq!(
+            KeyCodec::branch_tombstone_value().as_ref(),
+            &[BRANCH_TOMBSTONE_RECORD_VERSION]
+        );
+
+        // Unscoped, root, and foreign-branch keys cannot be tombstoned here.
+        assert_eq!(codec.branch_tombstone_key(&codec.dir_scan_key(7, 42)), None);
+        let root = KeyCodec::new();
+        assert_eq!(root.branch_tombstone_key(root.inode_key(7).as_ref()), None);
+        let other = KeyCodec::for_branch(BranchId(9));
+        assert_eq!(codec.branch_tombstone_key(other.inode_key(7).as_ref()), None);
+    }
+
+    #[test]
+    fn parse_any_segcount_key_reads_every_scope() {
+        let root = KeyCodec::new();
+        let branch = KeyCodec::for_branch(BranchId(7));
+
+        // Root-layout and branch-layout rows both decode; the branch id is
+        // skipped, not validated (a census cares about (epoch, counter)).
+        assert_eq!(
+            KeyCodec::parse_any_segcount_key(&root.segcount_key(3, 4)),
+            Some((3, 4))
+        );
+        assert_eq!(
+            KeyCodec::parse_any_segcount_key(&branch.segcount_key(3, 4)),
+            Some((3, 4))
+        );
+
+        // Other kinds and malformed rows are rejected.
+        assert_eq!(KeyCodec::parse_any_segcount_key(root.inode_key(3).as_ref()), None);
+        assert_eq!(KeyCodec::parse_any_segcount_key(b"meta\x09\x01"), None);
+        assert_eq!(
+            KeyCodec::parse_any_segcount_key(&branch.segcount_key(3, 4)[..8]),
+            None
+        );
+    }
+
+    #[test]
+    fn branch_tombstone_range_brackets_exactly_one_branch() {
+        let codec = KeyCodec::for_branch(BranchId(3));
+        let sibling = KeyCodec::for_branch(BranchId(4));
+
+        // The root codec has no tombstone range (the whole-kind range would
+        // cover other branches' rows).
+        assert_eq!(KeyCodec::new().branch_tombstone_range(), None);
+
+        let (start, end) = codec.branch_tombstone_range().unwrap();
+        let mine = codec
+            .branch_tombstone_key(codec.inode_key(1).as_ref())
+            .unwrap();
+        assert!(mine.as_ref() >= start.as_ref() && mine.as_ref() < end.as_ref());
+        let foreign = sibling
+            .branch_tombstone_key(sibling.inode_key(1).as_ref())
+            .unwrap();
+        assert!(!(foreign.as_ref() >= start.as_ref() && foreign.as_ref() < end.as_ref()));
+
+        // u32::MAX has no successor; the range falls back to the next kind.
+        let max = KeyCodec::for_branch(BranchId(u32::MAX));
+        let (start, end) = max.branch_tombstone_range().unwrap();
+        let mine = max
+            .branch_tombstone_key(max.inode_key(1).as_ref())
+            .unwrap();
+        assert!(mine.as_ref() >= start.as_ref() && mine.as_ref() < end.as_ref());
+    }
+
+    #[test]
+    fn branch_prefix_range_brackets_exactly_one_branch() {
+        let codec = KeyCodec::for_branch(BranchId(1));
+        let root = KeyCodec::new();
+        let sibling = KeyCodec::for_branch(BranchId(2));
+
+        let (start, end) = codec.prefix_range(KeyPrefix::SegCount);
+        let mine = codec.segcount_key(9, 9);
+        assert!(mine.as_ref() >= start.as_ref() && mine.as_ref() < end.as_ref());
+        // Neither the parent's nor a sibling's segcount keys fall in range.
+        for foreign in [root.segcount_key(9, 9), sibling.segcount_key(9, 9)] {
+            assert!(
+                !(foreign.as_ref() >= start.as_ref() && foreign.as_ref() < end.as_ref()),
+                "foreign-branch key leaked into the branch prefix range"
+            );
+        }
+
+        // The root codec's range covers the whole kind, branches included.
+        let (root_start, root_end) = root.prefix_range(KeyPrefix::SegCount);
+        for key in [root.segcount_key(1, 1), mine.clone()] {
+            assert!(key.as_ref() >= root_start.as_ref() && key.as_ref() < root_end.as_ref());
+        }
+
+        // Same bracketing in the extent domain.
+        let (start, end) = codec.prefix_range(KeyPrefix::Extent);
+        assert!(codec.extent_key(1, 0).as_ref() >= start.as_ref()
+            && codec.extent_key(1, 0).as_ref() < end.as_ref());
+        assert!(!(root.extent_key(1, 0).as_ref() >= start.as_ref()
+            && root.extent_key(1, 0).as_ref() < end.as_ref()));
+        assert!(!(sibling.extent_key(1, 0).as_ref() >= start.as_ref()
+            && sibling.extent_key(1, 0).as_ref() < end.as_ref()));
+    }
+
+    #[test]
+    fn scoped_branched_keys_sort_by_branch_then_suffix() {
+        let b1 = KeyCodec::for_branch(BranchId(1));
+        let b2 = KeyCodec::for_branch(BranchId(2));
+        // Within one branch, suffix order is preserved.
+        assert!(b1.inode_key(7).as_ref() < b1.inode_key(8).as_ref());
+        assert!(b1.segcount_key(5, 10).as_ref() < b1.segcount_key(5, 11).as_ref());
+        // Branches never interleave: all of branch 1 sorts before branch 2.
+        assert!(b1.inode_key(u64::MAX).as_ref() < b2.inode_key(0).as_ref());
+        assert!(b1.segcount_key(u64::MAX, u64::MAX).as_ref() < b2.segcount_key(0, 0).as_ref());
+        // The parent (no branch bytes) sorts before any branch's slice: its
+        // suffix's first byte compares against the branch id's high byte.
+        let root = KeyCodec::new();
+        assert!(root.inode_key(0).as_ref() < b1.inode_key(0).as_ref());
+    }
+
+    #[test]
+    fn branch_codecs_parse_their_own_scoped_keys() {
+        let codec = branch_codec();
+        let root = KeyCodec::new();
+
+        // Segcount roundtrips through the branch codec; the root codec
+        // rejects the widened key (wrong length) and vice versa.
+        let key = codec.segcount_key(3, 4);
+        assert_eq!(codec.parse_segcount_key(&key), Some((3, 4)));
+        assert_eq!(root.parse_segcount_key(&key), None);
+        assert_eq!(codec.parse_segcount_key(&root.segcount_key(3, 4)), None);
+
+        let extent = codec.extent_key(7, 9);
+        assert_eq!(codec.parse_extent_key(extent.as_ref()), Some(9));
+        assert_eq!(codec.parse_extent_key_full(extent.as_ref()), Some((7, 9)));
+        assert_eq!(root.parse_extent_key(extent.as_ref()), None);
+
+        // parse_key is branch-aware through id_offset as well.
+        match codec.parse_key(&codec.tombstone_key(11, 7)) {
+            ParsedKey::Tombstone { inode_id } => assert_eq!(inode_id, 7),
+            other => panic!("expected Tombstone, got {other:?}"),
+        }
+        match codec.parse_key(&codec.orphan_key(7)) {
+            ParsedKey::Orphan { inode_id } => assert_eq!(inode_id, 7),
+            other => panic!("expected Orphan, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn branch_registry_keys_are_global_and_well_bracketed() {
+        let codec = KeyCodec::new();
+        let entry = codec.branch_registry_key("agent-1");
+        assert!(entry.starts_with(META_DOMAIN));
+        assert_eq!(entry[META_DOMAIN.len()], PREFIX_BRANCH);
+        assert!(entry.ends_with(b"agent-1"));
+
+        let prefix = codec.branch_registry_prefix();
+        assert!(entry.starts_with(&prefix));
+        assert!(!codec.fork_registry_key("agent-1").starts_with(&prefix));
+        assert!(!codec.inode_key(9).as_ref().starts_with(&prefix));
+        assert!(!codec.branch_counter_key().starts_with(&prefix));
+
+        // The id counter is a System-subtyped key distinct from its siblings.
+        let counter = codec.branch_counter_key();
+        assert_eq!(counter[codec.kind_offset(KeyPrefix::System)], PREFIX_SYSTEM);
+        for other in [
+            codec.system_counter_key(),
+            codec.ha_seqno_key(),
+            codec.lineage_key(),
+            codec.taint_key(),
+            codec.last_orphan_sweep_key(),
+        ] {
+            assert_ne!(counter, other);
+        }
+    }
+
+    #[test]
+    fn branched_fixed_keys_compare_and_hash_by_key_bytes() {
+        let codec = branch_codec();
+        let root = KeyCodec::new();
+        // Same logical key, different layouts: unequal, ordered by raw bytes.
+        assert_ne!(codec.inode_key(7), root.inode_key(7));
+        assert_eq!(codec.inode_key(7), codec.inode_key(7));
+        assert!(root.inode_key(7) < codec.inode_key(7));
+        assert!(codec.extent_key(7, 1) < codec.extent_key(7, 2));
+        let mut set = std::collections::HashSet::new();
+        set.insert(codec.inode_key(7));
+        assert!(set.contains(&codec.inode_key(7)));
+        assert!(!set.contains(&root.inode_key(7)));
+    }
 }
 
 #[cfg(test)]
@@ -1195,5 +2107,167 @@ mod prop_tests {
                 "a metadata key leaked into the extent prefix range"
             );
         }
+    }
+
+    #[test]
+    fn scoped_suffix_strips_domain_kind_and_branch() {
+        let root = KeyCodec::new();
+        let branch = KeyCodec::for_branch(BranchId(7));
+
+        // Root codec: suffix follows `domain || kind`.
+        let root_entry = root.dir_entry_key(3, b"name");
+        let mut expected = 3u64.to_be_bytes().to_vec();
+        expected.extend_from_slice(b"name");
+        assert_eq!(root.scoped_suffix(&root_entry).unwrap(), expected.as_slice());
+
+        // Branch codec: suffix follows `domain || kind || branch`, and equals
+        // the parent's suffix for the same logical entry.
+        let branch_entry = branch.dir_entry_key(3, b"name");
+        assert_eq!(
+            branch.scoped_suffix(&branch_entry).unwrap(),
+            root.scoped_suffix(&root_entry).unwrap()
+        );
+
+        // Wrong branch, unscoped kinds, and junk are rejected.
+        assert!(
+            KeyCodec::for_branch(BranchId(8))
+                .scoped_suffix(&branch_entry)
+                .is_none()
+        );
+        assert!(root.scoped_suffix(&root.stats_shard_key(0)).is_none());
+        assert!(root.scoped_suffix(b"nonsense").is_none());
+        // The root codec does not read a branch key as a longer root key.
+        assert!(root.scoped_suffix(&branch_entry).is_some_and(|s| {
+            // Root layout reads the branch bytes as suffix payload; that is
+            // fine (the codecs serve different scopes) but must never equal
+            // the parent suffix.
+            s != root.scoped_suffix(&root_entry).unwrap()
+        }));
+    }
+
+    #[test]
+    fn adopt_parent_key_inverts_strip_branch() {
+        let branch = KeyCodec::for_branch(BranchId(9));
+        let root = KeyCodec::new();
+
+        for (parent, branch_key) in [
+            (
+                root.dir_entry_key(1, b"file"),
+                branch.dir_entry_key(1, b"file"),
+            ),
+            (
+                Bytes::from(root.inode_key(42)),
+                Bytes::from(branch.inode_key(42)),
+            ),
+            (
+                Bytes::from(root.extent_key(5, 6)),
+                Bytes::from(branch.extent_key(5, 6)),
+            ),
+        ] {
+            assert_eq!(branch.strip_branch(&branch_key).unwrap(), parent);
+            assert_eq!(branch.adopt_parent_key(&parent).unwrap(), branch_key);
+        }
+
+        // Root codec and unscoped keys have nothing to adopt.
+        assert!(root.adopt_parent_key(&root.dir_entry_key(1, b"x")).is_none());
+        assert!(
+            branch
+                .adopt_parent_key(&root.stats_shard_key(0))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn branch_tombstone_prefix_covers_exactly_one_kinds_shadows() {
+        let codec = KeyCodec::for_branch(BranchId(3));
+        let dir3_suffix = {
+            let mut s = 3u64.to_be_bytes().to_vec();
+            s.extend_from_slice(b"old-name");
+            s
+        };
+        let shadowed = codec.dir_entry_key(3, b"old-name");
+        let tombstone = codec.branch_tombstone_key(&shadowed).unwrap();
+
+        // The row parses back to its shadowed (kind, suffix).
+        assert_eq!(
+            codec.parse_branch_tombstone_key(&tombstone).unwrap(),
+            (KeyPrefix::DirEntry, dir3_suffix.as_slice())
+        );
+
+        // The (kind, suffix-prefix) range for a directory covers the row;
+        // sibling kinds and other branches' rows fall outside.
+        let prefix = codec.branch_tombstone_prefix(KeyPrefix::DirEntry, &3u64.to_be_bytes());
+        assert!(tombstone.starts_with(&prefix));
+        let inode_prefix = codec.branch_tombstone_prefix(KeyPrefix::Inode, b"");
+        assert!(!tombstone.starts_with(&inode_prefix));
+        assert!(
+            KeyCodec::for_branch(BranchId(4))
+                .parse_branch_tombstone_key(&tombstone)
+                .is_none()
+        );
+        assert!(
+            KeyCodec::new()
+                .parse_branch_tombstone_key(&tombstone)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn branch_tombstone_bound_re_roots_parent_bounds() {
+        let codec = KeyCodec::for_branch(BranchId(2));
+        let root = KeyCodec::new();
+
+        // A within-kind bound: kind byte and suffix are preserved verbatim.
+        let bound = root.dir_entry_key(8, b"n");
+        let tomb_bound = codec.branch_tombstone_bound(&bound).unwrap();
+        assert_eq!(
+            codec.parse_branch_tombstone_key(&tomb_bound).unwrap(),
+            (KeyPrefix::DirEntry, root.scoped_suffix(&bound).unwrap())
+        );
+
+        // A kind-end bound (`domain || kind + 1`) maps to the end of that
+        // kind's tombstone space even though 0x03 (DIR_SCAN) is unscoped.
+        let kind_end = Bytes::from_static(b"meta\x03");
+        let tomb_end = codec.branch_tombstone_bound(&kind_end).unwrap();
+        let entry_tombstone = codec
+            .branch_tombstone_key(&codec.dir_entry_key(1, b"a"))
+            .unwrap();
+        assert!(entry_tombstone.as_ref() < tomb_end.as_ref());
+        let scan_tombstone_prefix = codec.branch_tombstone_prefix(KeyPrefix::DirScan, b"");
+        assert!(scan_tombstone_prefix.as_ref() >= tomb_end.as_ref());
+
+        // Extent-domain bounds re-root into the meta-domain tombstone space.
+        let extent_bound: Bytes = root.extent_key(1, 0).into();
+        assert!(
+            codec
+                .branch_tombstone_bound(&extent_bound)
+                .unwrap()
+                .starts_with(META_DOMAIN)
+        );
+
+        // Root codec and out-of-domain bounds are rejected.
+        assert!(root.branch_tombstone_bound(&bound).is_none());
+        assert!(codec.branch_tombstone_bound(b"other").is_none());
+    }
+
+    #[test]
+    fn dir_entry_prefix_orders_entries_by_name() {
+        let codec = KeyCodec::for_branch(BranchId(5));
+        let prefix = codec.dir_entry_prefix(4);
+        assert!(codec.dir_entry_key(4, b"a").starts_with(&prefix));
+        assert!(codec.dir_entry_key(4, b"z").starts_with(&prefix));
+        assert!(!codec.dir_entry_key(5, b"a").starts_with(&prefix));
+        // Byte order of names is the scan order within the prefix.
+        assert!(codec.dir_entry_key(4, b"a") < codec.dir_entry_key(4, b"b"));
+        // Branch isolation: another branch's entries are not covered.
+        assert!(
+            !KeyCodec::for_branch(BranchId(6))
+                .dir_entry_key(4, b"a")
+                .starts_with(&prefix)
+        );
+        // Root codec's prefix is the historical layout (no branch bytes).
+        let root_prefix = KeyCodec::new().dir_entry_prefix(4);
+        assert!(KeyCodec::new().dir_entry_key(4, b"a").starts_with(&root_prefix));
+        assert!(!codec.dir_entry_key(4, b"a").starts_with(&root_prefix));
     }
 }

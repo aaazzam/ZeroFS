@@ -14,6 +14,10 @@ pub mod types;
 pub mod write_coordinator;
 
 mod boot;
+#[cfg(test)]
+mod branch_gc_tests;
+#[cfg(test)]
+mod branch_view_tests;
 mod handle;
 mod ops;
 #[cfg(test)]

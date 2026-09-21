@@ -235,24 +235,44 @@ async fn stage_seg_deltas(
 ) -> Result<StagedSegcounts, FsError> {
     // Missing counters start at zero. Read and decode failures abort the batch;
     // undercounting live bytes can make reclamation delete referenced data.
-    let bases: Vec<SegBase> = stream::iter(deltas)
+    //
+    // Branch-scope ownership guard (see Db::with_branch): a branch debits
+    // only counters that exist in its OWN scope. Deleting a file whose
+    // extents live in parent-owned segments (an inode the branch inherited
+    // through fallback) must not materialize a branch copy of the parent's
+    // counter — the parent's row is not the branch's to debit, and a
+    // negative branch-scope row would poison the branch's reclaim view. So
+    // for a non-root branch the base is read without parent fallback, and a
+    // missing own-scope row with a non-positive (pure-debit) delta is
+    // skipped: the extent-pointer delete still applies, the segment bytes
+    // stay accounted to the parent's counter. A credit (branch-owned
+    // segment writes) still starts a fresh branch counter at zero. Root
+    // handles are unaffected: their read has no fallback to bypass.
+    let root = db.branch().is_root();
+    let bases: Vec<Option<SegBase>> = stream::iter(deltas)
         .map(|(key, net)| async move {
-            match db.get_bytes_internal(&key).await {
-                Ok(None) => Ok((key, net, (0, 0))),
+            let read = if root {
+                db.get_bytes_internal(&key).await
+            } else {
+                db.get_bytes_own_internal(&key).await
+            };
+            match read {
+                Ok(None) if !root && net.0 <= 0 && net.1 <= 0 => Ok(None),
+                Ok(None) => Ok(Some((key, net, (0, 0)))),
                 Ok(Some(b)) => KeyCodec::decode_segcount(&b)
-                    .map(|base| (key, net, base))
+                    .map(|base| Some((key, net, base)))
                     .ok_or(FsError::IoError),
                 Err(error) => Err(FsError::from_db_error(&error)),
             }
         })
         .buffer_unordered(PARALLEL_SEGCOUNT_READS)
-        .try_collect()
+        .try_collect::<Vec<Option<SegBase>>>()
         .await?;
 
     let mut out = Vec::with_capacity(bases.len());
     let mut footprint_delta = SegmentFootprintDelta::default();
     let mut reclaim_changed = false;
-    for (key, (net_live, net_total), (cur_live, cur_total)) in bases {
+    for (key, (net_live, net_total), (cur_live, cur_total)) in bases.into_iter().flatten() {
         let live = (cur_live as i128 + net_live as i128).max(0) as u64;
         // `total` is monotonic: clamp to at least its current value.
         let total = (cur_total as i128 + net_total as i128).max(cur_total as i128) as u64;
@@ -359,7 +379,11 @@ async fn worker_loop(
         let mut seg_map: BTreeMap<bytes::Bytes, (i64, i64)> = BTreeMap::new();
         let mut segcount_delete_delta = SegmentFootprintDelta::default();
         let mut batch_dedup_entries: Vec<crate::dedup::DedupEntry> = Vec::new();
-        for (mut txn, reply) in batch {
+        let mut batch = batch.into_iter();
+        // Set when staging a transaction's ops into the merged batch fails:
+        // the batch is abandoned and every reply in it gets the error.
+        let mut apply_error = None;
+        while let Some((mut txn, reply)) = batch.next() {
             if let Some(guard) = txn.take_extent_ref_guard() {
                 extent_ref_guards.push(guard);
             }
@@ -391,15 +415,40 @@ async fn worker_loop(
             }
             segcount_delete_delta.merge(txn.take_segcount_delete_delta());
             if replicating {
+                debug_assert!(
+                    ctx.db.branch().is_root(),
+                    "basin branches are not supported under HA replication"
+                );
                 repl_ops.extend(txn.apply_to_collecting(&mut merged));
-            } else {
-                txn.apply_to(&mut merged);
+            } else if let Err(error) = ctx.db.apply_transaction(txn, &mut merged).await {
+                // A branch handle's delete remapping (real delete vs parent
+                // tombstone) reads the db; on failure abandon the whole
+                // merged batch rather than commit a partial view — the same
+                // posture as a segcount staging failure below. Root handles
+                // never fail here: apply_transaction is exactly apply_to.
+                apply_error = Some(FsError::from_db_error(&error));
+                replies.push(reply);
+                for (_, reply) in batch.by_ref() {
+                    replies.push(reply);
+                }
+                break;
             }
             replies.push(reply);
         }
         #[cfg(any(test, dst))]
         if let Some(reply) = barrier_reply {
             replies.push(PendingReply::Plain(reply));
+        }
+        if let Some(error) = apply_error {
+            // A failed batch may have advanced the in-memory inode watermark.
+            // Burn one ID so the next commit persists past it.
+            if ctx.inode_store.next_id() > last_emitted_counter {
+                ctx.inode_store.allocate();
+            }
+            for reply in replies {
+                reply.send(Err(error));
+            }
+            continue;
         }
 
         // Persist the allocation watermark only after it advances.
