@@ -54,6 +54,9 @@ struct StartupContext {
     /// Fork lineage when this volume is a fork: routes segment reads across
     /// ancestors and scopes reclamation to the fork's own epochs.
     fork_info: Option<crate::fork_info::ForkInfo>,
+    /// Basin branch to serve (`zerofs run --branch`), resolved against the
+    /// registry once the database is open. `None` serves the volume root.
+    branch_name: Option<String>,
 }
 
 /// Receiver handles carried through role election and takeover reconciliation.
@@ -123,7 +126,15 @@ impl StartupContext {
         settings: &Settings,
         db_mode: DatabaseMode,
         password: EncryptionPassword,
+        branch_name: Option<String>,
     ) -> Result<Self> {
+        if branch_name.is_some() && settings.replication.is_some() {
+            anyhow::bail!(
+                "--branch is not supported together with [replication]: a basin branch is a \
+                 view inside the volume's LSM and HA replication ships whole-database batches; \
+                 serve the branch without replication"
+            );
+        }
         let url = settings.storage.url.clone();
 
         let cache_config = CacheConfig {
@@ -180,6 +191,12 @@ impl StartupContext {
 
         info!("Loading or initializing encryption key from object store");
         let db_path = Path::from(actual_db_path.clone());
+        // A lazily created fork must materialize its clone and inherited key
+        // BEFORE we load (or worse, generate) an encryption key; see
+        // materialize_fork_storage_if_pending for the failure this prevents.
+        crate::fork_manager::materialize_fork_storage_if_pending(&object_store, &db_path)
+            .await
+            .context("Failed to materialize pending fork storage")?;
         let encryption_key = key_management::load_or_init_encryption_key(
             &object_store,
             &db_path,
@@ -242,6 +259,7 @@ impl StartupContext {
             // Populated in `open_db` from the volume's own LSM, once the
             // database is open.
             fork_info: None,
+            branch_name,
         })
     }
 
@@ -601,6 +619,19 @@ impl StartupContext {
                 return Ok(OpenOutcome::RetryRole);
             }
         }
+        // A lazily created fork materializes here, at its first open: the
+        // pending marker under the db path drives the deferred clone, key
+        // copy, and lineage write (see crate::fork_manager). A no-op for
+        // volumes without a marker, and idempotent across writer-open
+        // retries.
+        crate::fork_manager::materialize_fork_if_pending(
+            &self.object_store,
+            &Path::from(self.actual_db_path.clone()),
+            self.block_transformer.clone(),
+        )
+        .await
+        .context("Failed to materialize pending fork")?;
+
         let opened = build_slatedb(
             self.object_store.clone(),
             &self.cache_config,
@@ -850,6 +881,7 @@ impl ReconciledDb {
             recovering_handoff: _,
             opening: _,
             fork_info,
+            branch_name,
         } = startup;
 
         let serving_writer_epoch = match &slatedb {
@@ -1016,8 +1048,20 @@ impl ReconciledDb {
             );
         }
 
+        // A basin branch must already be registered (creation goes through
+        // the parent server's admin RPC); resolve it now that the database is
+        // open and construct the filesystem over its key-space view.
+        let branch = match &branch_name {
+            Some(name) => {
+                let id = crate::branch::resolve_branch_for_serving(&slatedb, name).await?;
+                info!("Serving basin branch {name:?} (id {})", id.0);
+                id
+            }
+            None => crate::fs::key_codec::BranchId::ROOT,
+        };
+
         let db_handle = slatedb.clone();
-        let fs = ZeroFS::try_new(
+        let fs = ZeroFS::try_new_for_branch(
             slatedb,
             settings.max_bytes(),
             metrics_recorder,
@@ -1032,6 +1076,8 @@ impl ReconciledDb {
             segment_codec,
             None,
             fork_base_epoch,
+            branch,
+            None,
         )
         .await
         .context("Failed to initialize filesystem")?;
@@ -1072,12 +1118,18 @@ impl ReconciledDb {
 }
 
 /// Run role election, database open, reconciliation, and activation.
+///
+/// `branch_name` (`zerofs run --branch`) serves one basin branch of the
+/// volume instead of the root; the branch must already exist in the
+/// registry. Read-only serving of a branch is supported; HA replication
+/// with a branch is rejected in `prepare`.
 pub async fn initialize_filesystem(
     settings: &Settings,
     password: EncryptionPassword,
     db_mode: DatabaseMode,
+    branch_name: Option<String>,
 ) -> Result<InitResult> {
-    let prepared = StartupContext::prepare(settings, db_mode, password).await?;
+    let prepared = StartupContext::prepare(settings, db_mode, password, branch_name).await?;
     let mut startup = prepared.start_receiver()?;
     'role_election: loop {
         startup.become_writer().await?;
@@ -1171,6 +1223,7 @@ mod role_decision_tests {
             recovering_handoff: false,
             opening: None,
             fork_info: None,
+            branch_name: None,
         };
         let election = tokio::spawn(async move {
             startup.become_writer().await?;

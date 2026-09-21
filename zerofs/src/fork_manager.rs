@@ -1,26 +1,48 @@
 //! Writable forks: branch a running volume's state into an independent,
 //! writable clone that shares all of the parent's existing objects.
 //!
-//! A fork is created in three steps:
+//! Fork creation is two-phase — `zerofs fork create` is a cheap pointer;
+//! the fork's state materializes on its first mount:
 //!
-//! 1. A durable checkpoint pins the parent's state (existing
-//!    [`CheckpointManager`] semantics: seal + flush under the barrier first).
-//! 2. SlateDB's clone builds a new, writable database at the fork's db path,
-//!    referencing the parent's SSTs as `external_ssts` — a shallow,
-//!    O(manifest) copy-on-write branch. The clone pins its source on the
-//!    parent's manifest, which also pauses reclamation of the parent's
-//!    referenced segments (same protection a persistent checkpoint gives).
-//! 3. The wrapped encryption key is copied to the fork's db path (keys are
-//!    per-path), the fork's freshly cloned database is opened once to write
-//!    its [`ForkInfo`] lineage record into its own LSM (durable before the
-//!    next step), and a registry entry for the fork is written into the
-//!    parent's LSM (see [`crate::fork_info`] for the two record types and the
-//!    crash-ordering guarantee).
+//! **Phase 1 — registration** ([`ForkManager::create_fork`] with
+//! `barrier = false`, the default; ~50ms):
 //!
-//! The fork is then served like any other volume: point a `[storage] url` at
-//! the fork's db path and `zerofs run`; startup reads the lineage back from
-//! the fork's LSM to route segment reads across ancestors (see
-//! [`crate::segment_path_router`]).
+//! 1. A durable checkpoint pins the branch point on the parent's *current
+//!    durable manifest*, taken directly on the parent database
+//!    (`CheckpointScope::Durable`) WITHOUT the seal+flush barrier. The branch
+//!    point can therefore lag HEAD by up to the flush interval — the
+//!    documented trade for a cheap create (`--barrier` forks exactly now).
+//! 2. A pending-materialization record is written to
+//!    `<fork db path>/.zerofs_fork_pending.json` (see [`PendingFork`]), and a
+//!    registry entry goes into the parent's LSM, in that order. No slatedb
+//!    clone, no key copy, no fork database open, no parent epoch bump.
+//!
+//! **Phase 2 — materialization** (automatic, at the fork's first open;
+//! see [`materialize_fork_if_pending`], hooked into startup before the
+//! fork's database opens):
+//!
+//! 1. SlateDB's clone builds a new, writable database at the fork's db path
+//!    from the pinned checkpoint, referencing the parent's SSTs as
+//!    `external_ssts` — a shallow, O(manifest) copy-on-write branch. The
+//!    clone pins its source on the parent's manifest, which also pauses
+//!    reclamation of the parent's referenced segments (same protection a
+//!    persistent checkpoint gives).
+//! 2. The wrapped encryption key is copied to the fork's db path (keys are
+//!    per-path), and the fork's freshly cloned database is opened once to
+//!    write its [`ForkInfo`] lineage record into its own LSM. The pending
+//!    marker is deleted last, so every step is retryable: a crash
+//!    mid-materialization re-runs from the top (the clone is idempotent).
+//!
+//! `barrier = true` runs both phases inline at create time (the pre-lazy
+//! behavior): the checkpoint is taken under the seal+flush barrier (see
+//! [`CheckpointManager`]), so the fork branches exactly the state at the
+//! call and is fully materialized before `create` returns — at ~1s instead
+//! of ~50ms.
+//!
+//! Either way the fork is then served like any other volume: point a
+//! `[storage] url` at the fork's db path and `zerofs run`; startup reads the
+//! lineage back from the fork's LSM to route segment reads across ancestors
+//! (see [`crate::segment_path_router`]).
 
 use crate::checkpoint_manager::CheckpointManager;
 use crate::db::SlateDbHandle;
@@ -29,14 +51,75 @@ use crate::fs::key_codec::KeyCodec;
 use crate::key_management;
 use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Utc};
-use object_store::ObjectStore;
+use object_store::{ObjectStore, ObjectStoreExt};
+use serde::{Deserialize, Serialize};
 use slatedb::admin::Admin;
 use slatedb::admin::AdminBuilder;
 use slatedb::admin::CloneSourceSpec;
-use slatedb::config::{CheckpointOptions, PutOptions, WriteOptions};
+use slatedb::config::{CheckpointOptions, CheckpointScope, PutOptions, WriteOptions};
 use slatedb::object_store::path::Path;
 use std::sync::Arc;
 use uuid::Uuid;
+
+/// Object name of the pending-materialization marker under a fork's db path:
+/// a lazily created fork carries one until its first open materializes it.
+pub const PENDING_FORK_FILENAME: &str = ".zerofs_fork_pending.json";
+
+/// Pending-materialization record: everything the fork's first open needs to
+/// build the fork database that lazy fork creation deferred (see the module
+/// docs). Written before the parent's registry entry, so a listed fork
+/// always has its marker.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingFork {
+    pub fork_info: ForkInfo,
+    pub source_checkpoint_id: Uuid,
+    #[allow(dead_code)] // diagnostics; deletes key off `source_checkpoint_id`
+    pub source_checkpoint_name: String,
+    /// Whether fork creation itself pinned the source checkpoint (the default
+    /// branch point and `--at` forks); deleting a pending fork then releases
+    /// it. False for a user-named `--from-checkpoint`, which the user owns.
+    pub source_checkpoint_owned: bool,
+}
+
+impl PendingFork {
+    fn path(fork_db_path: &Path) -> Path {
+        fork_db_path.clone().join(PENDING_FORK_FILENAME)
+    }
+
+    /// Read the pending-materialization marker under `fork_db_path`; `None`
+    /// when absent (non-fork volume, eager fork, or already materialized).
+    async fn load(
+        object_store: &Arc<dyn ObjectStore>,
+        fork_db_path: &Path,
+    ) -> Result<Option<Self>> {
+        match object_store.get(&Self::path(fork_db_path)).await {
+            Ok(result) => {
+                let bytes = result.bytes().await?;
+                let pending = serde_json::from_slice(&bytes)
+                    .context("parsing pending-fork materialization record")?;
+                Ok(Some(pending))
+            }
+            Err(object_store::Error::NotFound { .. }) => Ok(None),
+            Err(e) => Err(anyhow!("Failed to read pending-fork marker: {}", e)),
+        }
+    }
+}
+
+/// The resolved branch point of a fork: the parent checkpoint the clone
+/// starts from, and the fork's first writer epoch above it.
+struct BranchPoint {
+    checkpoint_id: Uuid,
+    checkpoint_name: String,
+    /// The fork's first writer epoch: the source manifest's writer epoch + 1.
+    /// The fork's first writable open bumps the writer epoch it inherits from
+    /// the source manifest, so its own segments start one epoch above that
+    /// manifest's epoch — which is NOT necessarily the live parent's current
+    /// epoch when forking an older state.
+    base_epoch: u64,
+    /// Whether fork creation owns the checkpoint (see
+    /// [`PendingFork::source_checkpoint_owned`]).
+    owned: bool,
+}
 
 pub struct ForkManager {
     db_handle: SlateDbHandle,
@@ -74,11 +157,24 @@ impl ForkManager {
     /// is given, the fork branches the volume as of the last manifest flushed
     /// before that timestamp (point-in-time fork); see
     /// [`ForkManager::manifest_at_time`].
+    ///
+    /// `barrier` selects the creation mode (see the module docs):
+    ///
+    /// - `false` (the CLI/RPC default) — **lazy**: registration only
+    ///   (branch-point checkpoint + pending-materialization record + registry
+    ///   entry, ~50ms). The clone, key copy, and lineage write defer to the
+    ///   fork's first open ([`materialize_fork_if_pending`]). Without the
+    ///   seal+flush barrier the branch point can lag HEAD by up to the flush
+    ///   interval.
+    /// - `true` — **eager**: the checkpoint is taken under the seal+flush
+    ///   barrier and the fork is fully materialized before this call returns
+    ///   (~1s).
     pub async fn create_fork(
         &self,
         name: &str,
         from_checkpoint: Option<String>,
         at: Option<DateTime<Utc>>,
+        barrier: bool,
     ) -> Result<ForkInfo> {
         let name = name.trim();
         validate_fork_name(name)?;
@@ -99,65 +195,9 @@ impl ForkManager {
             return Err(anyhow!("A fork named '{}' already exists", name));
         }
 
-        // Resolve the branch point: an existing named checkpoint, a manifest
-        // chosen by timestamp (point-in-time fork), or a fresh checkpoint of
-        // the current durable state. The fork's first writable open bumps the
-        // writer epoch it inherits from the source manifest, so its own
-        // segments start one epoch above that manifest's epoch — which is NOT
-        // necessarily the live parent's current epoch when forking an older
-        // state.
-        let (checkpoint_id, base_epoch) = if let Some(at) = at {
-            let manifest_id = self.manifest_at_time(at).await?;
-            let result = self
-                .admin
-                .create_detached_checkpoint_at(
-                    manifest_id,
-                    &CheckpointOptions {
-                        lifetime: None,
-                        source: None,
-                        name: Some(format!("pitr-{name}-{}", at.timestamp())),
-                    },
-                )
-                .await
-                .map_err(|e| anyhow!("Failed to pin historical manifest {}: {}", manifest_id, e))?;
-            let manifest = self
-                .admin
-                .read_manifest(Some(manifest_id))
-                .await
-                .map_err(|e| anyhow!("Failed to read historical manifest: {}", e))?
-                .ok_or_else(|| anyhow!("Historical manifest {} not found", manifest_id))?;
-            (result.id, manifest.writer_epoch() + 1)
-        } else {
-            let checkpoint = match from_checkpoint.as_deref().map(str::trim) {
-                Some("") | None => {
-                    let checkpoint_name = format!("fork-{name}-{}", Uuid::new_v4().simple());
-                    self.checkpoint_manager
-                        .create_checkpoint(&checkpoint_name)
-                        .await?
-                }
-                Some(checkpoint_name) => self
-                    .checkpoint_manager
-                    .get_checkpoint_info(checkpoint_name)
-                    .await?
-                    .ok_or_else(|| anyhow!("Checkpoint '{}' not found", checkpoint_name))?,
-            };
-            let checkpoints = self
-                .admin
-                .list_checkpoints(None)
-                .await
-                .map_err(|e| anyhow!("Failed to list checkpoints: {}", e))?;
-            let source = checkpoints
-                .into_iter()
-                .find(|cp| cp.id == checkpoint.id)
-                .ok_or_else(|| anyhow!("Checkpoint '{}' no longer exists", checkpoint.name))?;
-            let source_manifest = self
-                .admin
-                .read_manifest(Some(source.manifest_id))
-                .await
-                .map_err(|e| anyhow!("Failed to read checkpoint manifest: {}", e))?
-                .ok_or_else(|| anyhow!("Checkpoint manifest not found"))?;
-            (checkpoint.id, source_manifest.writer_epoch() + 1)
-        };
+        let branch_point = self
+            .resolve_branch_point(parent_db, name, from_checkpoint.as_deref(), at, barrier)
+            .await?;
 
         // The parent's own lineage (if it is itself a fork) extends the
         // ancestor chain the fork records.
@@ -171,84 +211,51 @@ impl ForkManager {
             base_epoch: parent_info.map(|info| info.base_epoch).unwrap_or(0),
         });
 
-        // Shallow-copy the metadata database. External SSTs stay referenced
-        // from the parent's path; nothing moves.
-        let admin = AdminBuilder::new(
-            Path::from(fork_db_path.clone()),
-            Arc::clone(&self.object_store),
-        )
-        .build();
-        admin
-            .create_clone_builder_from_source(CloneSourceSpec::with_checkpoint(
-                self.parent_db_path.clone(),
-                checkpoint_id,
-            ))
-            .build()
-            .await
-            .map_err(|e| anyhow!("Failed to clone database for fork '{}': {}", name, e))?;
-
-        // Encryption keys are per db path; the fork reads the parent's
-        // segments and SSTs, so it needs the same wrapped key.
-        key_management::copy_wrapped_key(
-            &self.object_store,
-            &self.parent_db_path,
-            &Path::from(fork_db_path.clone()),
-        )
-        .await
-        .context("Failed to copy encryption key to fork")?;
-
         let info = ForkInfo {
             name: name.to_string(),
             parent_db_path: self.parent_db_path.as_ref().to_string(),
-            base_epoch,
+            base_epoch: branch_point.base_epoch,
             created_at: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)?
                 .as_secs(),
             ancestors,
         };
 
-        // Open the freshly cloned fork database once to persist the lineage
-        // record into the fork's own LSM. Opened with the parent's durability
-        // posture (no WAL; explicit flush) so the record is SST-durable before
-        // the registry entry below publishes the fork. This open consumes the
-        // fork's first writer epoch (base_epoch), so the fork's serving open
-        // writes segments at base_epoch + 1 — routing compares `>= base_epoch`,
-        // so the gap is harmless.
-        {
-            let settings = slatedb::config::Settings {
-                wal_enabled: false,
-                flush_interval: None,
-                compactor_options: None,
-                garbage_collector_options: None,
-                compression_codec: None, // handled by the block transformer
-                ..Default::default()
-            };
-            let fork_db = slatedb::DbBuilder::new(
-                Path::from(fork_db_path.clone()),
-                Arc::clone(&self.object_store),
+        if barrier {
+            // Eager: materialize now, from the barriered branch point.
+            materialize_fork_db(
+                &self.object_store,
+                &self.block_transformer,
+                &info,
+                branch_point.checkpoint_id,
             )
-            .with_settings(settings)
-            .with_block_transformer(Arc::clone(&self.block_transformer))
-            .with_filter_policies(crate::fs::filter_policy::filter_policies())
-            .with_segment_extractor(Arc::new(crate::segment_extractor::ZeroFsSegmentExtractor))
-            .build()
-            .await
-            .map_err(|e| anyhow!("Failed to open fork database '{}': {}", fork_db_path, e))?;
-            info.save(&fork_db).await?;
-            fork_db
-                .flush()
+            .await?;
+        } else {
+            // Lazy: publish the pending-materialization record the fork's
+            // first open will consume.
+            let pending = PendingFork {
+                fork_info: info.clone(),
+                source_checkpoint_id: branch_point.checkpoint_id,
+                source_checkpoint_name: branch_point.checkpoint_name,
+                source_checkpoint_owned: branch_point.owned,
+            };
+            let bytes = serde_json::to_vec(&pending)?;
+            self.object_store
+                .put(
+                    &PendingFork::path(&Path::from(fork_db_path.clone())),
+                    bytes.into(),
+                )
                 .await
-                .map_err(|e| anyhow!("Failed to flush fork lineage record: {}", e))?;
-            fork_db
-                .close()
-                .await
-                .map_err(|e| anyhow!("Failed to close fork database: {}", e))?;
+                .map_err(|e| anyhow!("Failed to write pending-fork marker: {}", e))?;
         }
 
-        // Registry entry LAST, into the parent's LSM: a crash can now leave a
-        // fork whose lineage is durable but unlisted (an orphan the operator
-        // can re-register), never a registry entry for a fork whose lineage
-        // record is missing.
+        // Registry entry LAST, into the parent's LSM. Eager: a crash can now
+        // leave a fork whose lineage is durable but unlisted (an orphan the
+        // operator can re-register), never a registry entry for a fork whose
+        // lineage record is missing. Lazy: a crash can leave a pending marker
+        // without a registry entry (an orphan `fork delete` can't see but the
+        // first open still materializes), never a listed fork without its
+        // marker.
         parent_db
             .put_with_options(
                 &codec.fork_registry_key(name),
@@ -260,6 +267,108 @@ impl ForkManager {
             .map_err(|e| anyhow!("Failed to register fork '{}': {}", name, e))?;
 
         Ok(info)
+    }
+
+    /// Resolve the fork's branch point: an existing named checkpoint, a
+    /// manifest chosen by timestamp (point-in-time fork), or a fresh
+    /// checkpoint of the current durable state. `barrier` decides whether
+    /// the fresh checkpoint is taken under the seal+flush barrier
+    /// ([`CheckpointManager`], eager) or directly on the parent database
+    /// (lazy — `CheckpointScope::Durable` checkpoints the already-durable
+    /// manifest, so the branch point can lag HEAD by up to the flush
+    /// interval).
+    async fn resolve_branch_point(
+        &self,
+        parent_db: &slatedb::Db,
+        name: &str,
+        from_checkpoint: Option<&str>,
+        at: Option<DateTime<Utc>>,
+        barrier: bool,
+    ) -> Result<BranchPoint> {
+        if let Some(at) = at {
+            let manifest_id = self.manifest_at_time(at).await?;
+            let checkpoint_name = format!("pitr-{name}-{}", at.timestamp());
+            let result = self
+                .admin
+                .create_detached_checkpoint_at(
+                    manifest_id,
+                    &CheckpointOptions {
+                        lifetime: None,
+                        source: None,
+                        name: Some(checkpoint_name.clone()),
+                    },
+                )
+                .await
+                .map_err(|e| anyhow!("Failed to pin historical manifest {}: {}", manifest_id, e))?;
+            let manifest = self
+                .admin
+                .read_manifest(Some(manifest_id))
+                .await
+                .map_err(|e| anyhow!("Failed to read historical manifest: {}", e))?
+                .ok_or_else(|| anyhow!("Historical manifest {} not found", manifest_id))?;
+            return Ok(BranchPoint {
+                checkpoint_id: result.id,
+                checkpoint_name,
+                base_epoch: manifest.writer_epoch() + 1,
+                owned: true,
+            });
+        }
+
+        let (checkpoint_id, checkpoint_name, owned) = match from_checkpoint.map(str::trim) {
+            Some("") | None => {
+                let checkpoint_name = format!("fork-{name}-{}", Uuid::new_v4().simple());
+                if barrier {
+                    self.checkpoint_manager
+                        .create_checkpoint(&checkpoint_name)
+                        .await
+                        .map(|cp| (cp.id, cp.name, true))?
+                } else {
+                    // Lazy: checkpoint the already-durable manifest directly,
+                    // skipping the seal+flush barrier (and its ~0.2-0.5s).
+                    let result = parent_db
+                        .create_checkpoint(
+                            CheckpointScope::Durable,
+                            &CheckpointOptions {
+                                lifetime: None,
+                                source: None,
+                                name: Some(checkpoint_name.clone()),
+                            },
+                        )
+                        .await
+                        .map_err(|e| anyhow!("Failed to create branch-point checkpoint: {}", e))?;
+                    (result.id, checkpoint_name, true)
+                }
+            }
+            Some(checkpoint_name) => self
+                .checkpoint_manager
+                .get_checkpoint_info(checkpoint_name)
+                .await?
+                .map(|cp| (cp.id, cp.name, false))
+                .ok_or_else(|| anyhow!("Checkpoint '{}' not found", checkpoint_name))?,
+        };
+
+        let checkpoints = self
+            .admin
+            .list_checkpoints(None)
+            .await
+            .map_err(|e| anyhow!("Failed to list checkpoints: {}", e))?;
+        let source = checkpoints
+            .into_iter()
+            .find(|cp| cp.id == checkpoint_id)
+            .ok_or_else(|| anyhow!("Checkpoint '{}' no longer exists", checkpoint_name))?;
+        let source_manifest = self
+            .admin
+            .read_manifest(Some(source.manifest_id))
+            .await
+            .map_err(|e| anyhow!("Failed to read checkpoint manifest: {}", e))?
+            .ok_or_else(|| anyhow!("Checkpoint manifest not found"))?;
+
+        Ok(BranchPoint {
+            checkpoint_id,
+            checkpoint_name,
+            base_epoch: source_manifest.writer_epoch() + 1,
+            owned,
+        })
     }
 
     /// The id of the last manifest flushed at or before `target`.
@@ -461,36 +570,35 @@ impl ForkManager {
         let fork_admin =
             AdminBuilder::new(fork_db_path.clone(), Arc::clone(&self.object_store)).build();
 
-        // Release the GC pin: the clone pinned an unnamed checkpoint on
-        // this volume's manifest, recorded in the fork's own manifest as
-        // this parent's `external_dbs` entry (`final_checkpoint_id`). While
-        // it exists, the parent's segment reclamation pauses (any
-        // persistent checkpoint protects segments indefinitely), so this is
-        // what resumes it. A fork too corrupt to read has effectively lost
-        // its pin record; warn and proceed (slatedb's delete_db below
-        // strips the pin itself when it can read the manifest).
-        match fork_admin.read_manifest(None).await {
-            Ok(Some(manifest)) => {
-                for external_db in manifest.external_dbs() {
-                    if external_db.path != self.parent_db_path.as_ref() {
-                        continue;
-                    }
-                    if let Some(pin) = external_db.final_checkpoint_id {
-                        self.admin.delete_checkpoint(pin).await.map_err(|e| {
-                            anyhow!("Failed to release fork '{}'s pin on the parent: {}", name, e)
-                        })?;
-                    }
-                }
+        // A fork still pending materialization (lazy create, never opened)
+        // has no slatedb database to delete: release its creation-owned
+        // source checkpoint, any pin a crashed mid-materialization clone
+        // took, and every object under its db path (the pending marker, at
+        // minimum), then unregister.
+        if let Some(pending) = PendingFork::load(&self.object_store, &fork_db_path).await? {
+            if pending.source_checkpoint_owned {
+                // Idempotent, so a retried delete is fine.
+                self.admin
+                    .delete_checkpoint(pending.source_checkpoint_id)
+                    .await
+                    .map_err(|e| {
+                        anyhow!("Failed to delete fork '{}'s source checkpoint: {}", name, e)
+                    })?;
             }
-            Ok(None) => {}
-            Err(e) => {
-                tracing::warn!(
-                    "Could not read fork '{}'s manifest to release its pin ({}); proceeding",
-                    name,
-                    e
-                );
+            self.release_parent_pin(&fork_admin, name).await?;
+            let mut remaining = self.object_store.list(Some(&fork_db_path));
+            while let Some(meta) = remaining.try_next().await? {
+                object_store::ObjectStoreExt::delete(&*self.object_store, &meta.location).await?;
             }
+            // Registry entry LAST (see the materialized path below).
+            parent_db
+                .delete_with_options(&registry_key, &WriteOptions::default())
+                .await
+                .map_err(|e| anyhow!("Failed to unregister fork '{}': {}", name, e))?;
+            return Ok(());
         }
+
+        self.release_parent_pin(&fork_admin, name).await?;
 
         // Delete the fork's database. slatedb's delete_db removes every
         // object under the fork's db path (manifests, SSTs, WAL) behind a
@@ -523,6 +631,45 @@ impl ForkManager {
         Ok(())
     }
 
+    /// Release the GC pin a materialized (or partially materialized) fork
+    /// holds on this volume's manifest: the clone pinned an unnamed
+    /// checkpoint on this volume, recorded in the fork's own manifest as
+    /// this parent's `external_dbs` entry (`final_checkpoint_id`). While it
+    /// exists, the parent's segment reclamation pauses (any persistent
+    /// checkpoint protects segments indefinitely), so this is what resumes
+    /// it. A fork too corrupt to read has effectively lost its pin record;
+    /// warn and proceed (slatedb's delete_db strips the pin itself when it
+    /// can read the manifest).
+    async fn release_parent_pin(&self, fork_admin: &Admin, name: &str) -> Result<()> {
+        match fork_admin.read_manifest(None).await {
+            Ok(Some(manifest)) => {
+                for external_db in manifest.external_dbs() {
+                    if external_db.path != self.parent_db_path.as_ref() {
+                        continue;
+                    }
+                    if let Some(pin) = external_db.final_checkpoint_id {
+                        self.admin.delete_checkpoint(pin).await.map_err(|e| {
+                            anyhow!(
+                                "Failed to release fork '{}'s pin on the parent: {}",
+                                name,
+                                e
+                            )
+                        })?;
+                    }
+                }
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!(
+                    "Could not read fork '{}'s manifest to release its pin ({}); proceeding",
+                    name,
+                    e
+                );
+            }
+        }
+        Ok(())
+    }
+
     /// Point-read of one registry key on the parent's (writable) database.
     async fn registry_value(
         &self,
@@ -538,6 +685,139 @@ impl ForkManager {
             .await
             .map_err(|e| anyhow!("Failed to read fork registry: {}", e))
     }
+}
+
+/// Build the fork's database at its db path: slatedb clone from the source
+/// checkpoint, wrapped-key copy, then the one-time lineage write into the
+/// fork's own LSM. Shared by eager fork creation and first-open
+/// materialization; every step is idempotent (the clone is retryable per
+/// slatedb's clone builder), so a crash mid-way re-runs cleanly.
+async fn materialize_fork_db(
+    object_store: &Arc<dyn ObjectStore>,
+    block_transformer: &Arc<dyn slatedb::BlockTransformer>,
+    info: &ForkInfo,
+    source_checkpoint_id: Uuid,
+) -> Result<()> {
+    let fork_db_path = Path::from(ForkInfo::db_path(&info.parent_db_path, &info.name));
+    let parent_db_path = Path::from(info.parent_db_path.clone());
+
+    // Shallow-copy the metadata database. External SSTs stay referenced
+    // from the parent's path; nothing moves.
+    let admin = AdminBuilder::new(fork_db_path.clone(), Arc::clone(object_store)).build();
+    admin
+        .create_clone_builder_from_source(CloneSourceSpec::with_checkpoint(
+            parent_db_path.clone(),
+            source_checkpoint_id,
+        ))
+        .build()
+        .await
+        .map_err(|e| anyhow!("Failed to clone database for fork '{}': {}", info.name, e))?;
+
+    // Encryption keys are per db path; the fork reads the parent's
+    // segments and SSTs, so it needs the same wrapped key.
+    key_management::copy_wrapped_key(object_store, &parent_db_path, &fork_db_path)
+        .await
+        .context("Failed to copy encryption key to fork")?;
+
+    // Open the freshly cloned fork database once to persist the lineage
+    // record into the fork's own LSM. Opened with the parent's durability
+    // posture (no WAL; explicit flush) so the record is SST-durable before
+    // the fork is served. This open consumes the fork's first writer epoch
+    // (base_epoch), so the fork's serving open writes segments at
+    // base_epoch + 1 — routing compares `>= base_epoch`, so the gap is
+    // harmless.
+    let settings = slatedb::config::Settings {
+        wal_enabled: false,
+        flush_interval: None,
+        compactor_options: None,
+        garbage_collector_options: None,
+        compression_codec: None, // handled by the block transformer
+        ..Default::default()
+    };
+    let fork_db = slatedb::DbBuilder::new(fork_db_path.clone(), Arc::clone(object_store))
+        .with_settings(settings)
+        .with_block_transformer(Arc::clone(block_transformer))
+        .with_filter_policies(crate::fs::filter_policy::filter_policies())
+        .with_segment_extractor(Arc::new(crate::segment_extractor::ZeroFsSegmentExtractor))
+        .build()
+        .await
+        .map_err(|e| anyhow!("Failed to open fork database '{}': {}", fork_db_path, e))?;
+    info.save(&fork_db).await?;
+    fork_db
+        .flush()
+        .await
+        .map_err(|e| anyhow!("Failed to flush fork lineage record: {}", e))?;
+    fork_db
+        .close()
+        .await
+        .map_err(|e| anyhow!("Failed to close fork database: {}", e))?;
+    Ok(())
+}
+
+/// Pre-key-init phase of pending-fork materialization: run the slatedb
+/// clone and copy the parent's wrapped key into the fork's db path, WITHOUT
+/// touching the lineage record or the marker. Must run before the volume's
+/// encryption key is loaded — otherwise a first open would generate a fresh
+/// wrong key, then materialization would write fork SSTs the parent's key
+/// cannot read (and the parent's SSTs become undecryptable to the fork).
+/// Idempotent: the slatedb clone is retryable and the key copy overwrites
+/// with identical bytes.
+pub async fn materialize_fork_storage_if_pending(
+    object_store: &Arc<dyn ObjectStore>,
+    db_path: &Path,
+) -> Result<bool> {
+    let Some(pending) = PendingFork::load(object_store, db_path).await? else {
+        return Ok(false);
+    };
+    let parent_db_path = Path::from(pending.fork_info.parent_db_path.clone());
+    let admin = AdminBuilder::new(db_path.clone(), Arc::clone(object_store)).build();
+    admin
+        .create_clone_builder_from_source(CloneSourceSpec::with_checkpoint(
+            parent_db_path.clone(),
+            pending.source_checkpoint_id,
+        ))
+        .build()
+        .await
+        .map_err(|e| {
+            anyhow!(
+                "Failed to clone database for fork '{}': {}",
+                pending.fork_info.name,
+                e
+            )
+        })?;
+    key_management::copy_wrapped_key(object_store, &parent_db_path, db_path)
+        .await
+        .context("Failed to copy encryption key to fork")?;
+    Ok(true)
+}
+
+/// Materialize a lazily created fork at its first open (see the module
+/// docs). Reads the pending-materialization marker under `db_path`; absent
+/// marker => no-op (`Ok(false)`), so this is cheap to call on every volume
+/// startup. Otherwise runs the deferred clone, key copy, and lineage write,
+/// then deletes the marker — last, so a crash mid-materialization re-runs
+/// from the top on the next open. Returns `Ok(true)` when this call
+/// materialized the fork.
+pub async fn materialize_fork_if_pending(
+    object_store: &Arc<dyn ObjectStore>,
+    db_path: &Path,
+    block_transformer: Arc<dyn slatedb::BlockTransformer>,
+) -> Result<bool> {
+    let Some(pending) = PendingFork::load(object_store, db_path).await? else {
+        return Ok(false);
+    };
+    materialize_fork_db(
+        object_store,
+        &block_transformer,
+        &pending.fork_info,
+        pending.source_checkpoint_id,
+    )
+    .await?;
+    object_store
+        .delete(&PendingFork::path(db_path))
+        .await
+        .map_err(|e| anyhow!("Failed to delete pending-fork marker: {}", e))?;
+    Ok(true)
 }
 
 /// The manifest sequence id in a `<db path>/manifest/<id>.manifest` key.
@@ -758,6 +1038,11 @@ mod tests {
         let block_transformer: Arc<dyn slatedb::BlockTransformer> =
             ZeroFsBlockTransformer::try_new_arc(&TEST_KEY, CompressionConfig::default())
                 .expect("test key should be lockable");
+        // Mirrors the production startup hook (StartupContext::open_db): a
+        // lazily created fork materializes at its first open.
+        materialize_fork_if_pending(&object_store, &db_path, Arc::clone(&block_transformer))
+            .await
+            .unwrap();
         let slatedb = Arc::new(
             DbBuilder::new(db_path.clone(), Arc::clone(&object_store))
                 .with_settings(settings)
@@ -880,7 +1165,10 @@ mod tests {
             .await
             .unwrap();
 
-        let info = fork_manager.create_fork("f1", None, None).await.unwrap();
+        let info = fork_manager
+            .create_fork("f1", None, None, true)
+            .await
+            .unwrap();
         assert_eq!(info.base_epoch, 2, "fork starts one epoch above the parent");
         assert_eq!(info.ancestors.len(), 1);
 
@@ -952,7 +1240,10 @@ mod tests {
             .unwrap();
 
         // Fork f1 and write into it.
-        fork_manager.create_fork("f1", None, None).await.unwrap();
+        fork_manager
+            .create_fork("f1", None, None, true)
+            .await
+            .unwrap();
         let (f1_fs, f1_db) =
             open_volume(Arc::clone(&object_store), Path::from("vol/forks/f1")).await;
         let (f1_file_id, _) = f1_fs
@@ -971,7 +1262,7 @@ mod tests {
             Arc::clone(&object_store),
             &f1_fs,
         );
-        let g_info = g_manager.create_fork("g", None, None).await.unwrap();
+        let g_info = g_manager.create_fork("g", None, None, true).await.unwrap();
         // f1 was opened twice before the checkpoint (the lineage write at
         // creation, then the serving open above), so its writer epoch is 3.
         assert_eq!(g_info.base_epoch, 4);
@@ -1049,7 +1340,7 @@ mod tests {
             &parent_fs,
         );
         let info = fork_manager
-            .create_fork("past", Some("old".to_string()), None)
+            .create_fork("past", Some("old".to_string()), None, true)
             .await
             .unwrap();
         assert_eq!(
@@ -1137,7 +1428,7 @@ mod tests {
         parent_fs.flush_coordinator.flush().await.unwrap();
 
         let info = fork_manager
-            .create_fork("pit", None, Some(target))
+            .create_fork("pit", None, Some(target), true)
             .await
             .unwrap();
         let (fork_fs, _fork_db) =
@@ -1156,7 +1447,7 @@ mod tests {
         assert_eq!(info.base_epoch, 2);
         assert!(
             fork_manager
-                .create_fork("too-early", None, Some(chrono::DateTime::UNIX_EPOCH))
+                .create_fork("too-early", None, Some(chrono::DateTime::UNIX_EPOCH), true)
                 .await
                 .is_err()
         );
@@ -1282,7 +1573,10 @@ mod tests {
             .await
             .unwrap();
 
-        fork_manager.create_fork("f1", None, None).await.unwrap();
+        fork_manager
+            .create_fork("f1", None, None, true)
+            .await
+            .unwrap();
         let forks = fork_manager.list_forks().await.unwrap();
         assert_eq!(forks.len(), 1);
         assert_eq!(forks[0].name, "f1");
@@ -1340,9 +1634,15 @@ mod tests {
             .await
             .unwrap();
 
-        fork_manager.create_fork("f1", None, None).await.unwrap();
+        fork_manager
+            .create_fork("f1", None, None, true)
+            .await
+            .unwrap();
         // A sibling whose name extends f1's: prefix scoping must never catch it.
-        fork_manager.create_fork("f12", None, None).await.unwrap();
+        fork_manager
+            .create_fork("f12", None, None, true)
+            .await
+            .unwrap();
 
         // Write data inside f1, then stop it (the operator contract for delete).
         let (f1_fs, f1_db) =
@@ -1395,7 +1695,10 @@ mod tests {
         assert_eq!(&data[..], b"parent data", "sibling still reads the parent");
 
         // The name is free again.
-        fork_manager.create_fork("f1", None, None).await.unwrap();
+        fork_manager
+            .create_fork("f1", None, None, true)
+            .await
+            .unwrap();
         let mut names: Vec<String> = fork_manager
             .list_forks()
             .await
@@ -1415,7 +1718,10 @@ mod tests {
         let (_parent_fs, fork_manager, object_store, _parent_path, _parent_db) =
             new_parent_volume().await;
 
-        fork_manager.create_fork("f1", None, None).await.unwrap();
+        fork_manager
+            .create_fork("f1", None, None, true)
+            .await
+            .unwrap();
 
         let fork_admin =
             AdminBuilder::new(Path::from("vol/forks/f1"), Arc::clone(&object_store)).build();
@@ -1445,9 +1751,10 @@ mod tests {
             "pin released by the delete"
         );
         assert!(
-            after
-                .iter()
-                .any(|cp| cp.name.as_deref().is_some_and(|n| n.starts_with("fork-f1-"))),
+            after.iter().any(|cp| cp
+                .name
+                .as_deref()
+                .is_some_and(|n| n.starts_with("fork-f1-"))),
             "the named branch-point checkpoint survives"
         );
     }
@@ -1457,7 +1764,10 @@ mod tests {
         let (_parent_fs, fork_manager, object_store, _parent_path, _parent_db) =
             new_parent_volume().await;
 
-        fork_manager.create_fork("f1", None, None).await.unwrap();
+        fork_manager
+            .create_fork("f1", None, None, true)
+            .await
+            .unwrap();
         let (f1_fs, f1_db) =
             open_volume(Arc::clone(&object_store), Path::from("vol/forks/f1")).await;
         let (_, g_manager) = managers(
@@ -1466,7 +1776,7 @@ mod tests {
             Arc::clone(&object_store),
             &f1_fs,
         );
-        g_manager.create_fork("g", None, None).await.unwrap();
+        g_manager.create_fork("g", None, None, true).await.unwrap();
 
         let err = fork_manager.delete_fork("f1").await.unwrap_err();
         assert!(
@@ -1488,5 +1798,333 @@ mod tests {
             err.to_string().contains("not found"),
             "unexpected error: {err}"
         );
+    }
+
+    /// Lazy create registers the fork without materializing it: registry
+    /// entry + pending marker only — no clone, no wrapped key, no fork
+    /// database open, no parent epoch bump. The first open materializes.
+    #[tokio::test]
+    async fn lazy_fork_create_registers_then_materializes_on_first_open() {
+        use futures::StreamExt;
+        let (parent_fs, fork_manager, object_store, _parent_path, parent_db) =
+            new_parent_volume().await;
+        let creds = test_creds();
+        let auth = root_auth();
+
+        let (file_id, _) = parent_fs
+            .create(&creds, 0, b"hello.txt", &SetAttributes::default())
+            .await
+            .unwrap();
+        parent_fs
+            .write(&auth, file_id, 0, &Bytes::from_static(b"hello from parent"))
+            .await
+            .unwrap();
+        // The lazy branch point is the durable manifest: publish it.
+        parent_fs.flush_coordinator.flush().await.unwrap();
+
+        let SlateDbHandle::ReadWrite(db) = &parent_db else {
+            panic!("parent volume is writable");
+        };
+        let parent_epoch_before = db.subscribe().borrow().current_manifest.writer_epoch();
+
+        let info = fork_manager
+            .create_fork("f1", None, None, false)
+            .await
+            .unwrap();
+        assert_eq!(info.base_epoch, 2);
+        assert_eq!(info.ancestors.len(), 1);
+
+        // Registered in the parent's LSM...
+        let forks = fork_manager.list_forks().await.unwrap();
+        assert_eq!(forks.len(), 1);
+        assert_eq!(forks[0].name, "f1");
+
+        // ...with a pending marker as the ONLY object under the fork's db
+        // path: no clone manifests, no SSTs, no wrapped key...
+        let objects: Vec<_> = object_store
+            .list(Some(&Path::from("vol/forks/f1")))
+            .collect()
+            .await;
+        assert_eq!(objects.len(), 1, "only the pending marker: {objects:?}");
+        assert_eq!(
+            objects[0].as_ref().unwrap().location,
+            PendingFork::path(&Path::from("vol/forks/f1"))
+        );
+
+        // ...and the parent's writer epoch untouched (no fork database open).
+        let parent_epoch_after = db.subscribe().borrow().current_manifest.writer_epoch();
+        assert_eq!(parent_epoch_before, parent_epoch_after);
+
+        // First open materializes: the fork reads the parent's file, and its
+        // writes stay isolated.
+        let (fork_fs, fork_db) =
+            open_volume(Arc::clone(&object_store), Path::from("vol/forks/f1")).await;
+        let loaded = ForkInfo::load(&fork_db)
+            .await
+            .unwrap()
+            .expect("lineage persisted in the fork's LSM");
+        assert_eq!(loaded.base_epoch, 2);
+        let (data, _) = fork_fs.read_file(&auth, file_id, 0, 1024).await.unwrap();
+        assert_eq!(&data[..], b"hello from parent");
+        let (fork_file_id, _) = fork_fs
+            .create(&creds, 0, b"fork-only.txt", &SetAttributes::default())
+            .await
+            .unwrap();
+        fork_fs
+            .write(&auth, fork_file_id, 0, &Bytes::from_static(b"fork write"))
+            .await
+            .unwrap();
+        assert!(matches!(
+            parent_fs.lookup(&creds, 0, b"fork-only.txt").await,
+            Err(FsError::NotFound)
+        ));
+
+        // The marker is gone, and the clone now lives under the fork's path.
+        let pending = PendingFork::load(&object_store, &Path::from("vol/forks/f1"))
+            .await
+            .unwrap();
+        assert!(pending.is_none(), "materialization cleared the marker");
+        let manifests: Vec<_> = object_store
+            .list(Some(&Path::from("vol/forks/f1/manifest")))
+            .collect()
+            .await;
+        assert!(!manifests.is_empty(), "materialization cloned the database");
+    }
+
+    /// Without the seal+flush barrier, the lazy branch point is the
+    /// already-durable manifest: writes not yet flushed at create time are
+    /// NOT part of the fork (the documented trade for a cheap create).
+    #[tokio::test]
+    async fn lazy_fork_create_branches_the_durable_state_without_a_barrier() {
+        let (parent_fs, fork_manager, object_store, _parent_path, _parent_db) =
+            new_parent_volume().await;
+        let creds = test_creds();
+        let auth = root_auth();
+
+        let (file_id, _) = parent_fs
+            .create(&creds, 0, b"unflushed.txt", &SetAttributes::default())
+            .await
+            .unwrap();
+        parent_fs
+            .write(&auth, file_id, 0, &Bytes::from_static(b"not yet durable"))
+            .await
+            .unwrap();
+        // Deliberately NO flush: the durable manifest does not know the file.
+
+        fork_manager
+            .create_fork("f1", None, None, false)
+            .await
+            .unwrap();
+        let (fork_fs, _fork_db) =
+            open_volume(Arc::clone(&object_store), Path::from("vol/forks/f1")).await;
+        assert!(matches!(
+            fork_fs.lookup(&creds, 0, b"unflushed.txt").await,
+            Err(FsError::NotFound)
+        ));
+    }
+
+    /// Deleting a pending fork removes the registry entry, the pending
+    /// marker, and the creation-owned source checkpoint — no slatedb
+    /// database was ever built.
+    #[tokio::test]
+    async fn delete_pending_fork_removes_registry_marker_and_source_checkpoint() {
+        use futures::StreamExt;
+        let (_parent_fs, fork_manager, object_store, _parent_path, _parent_db) =
+            new_parent_volume().await;
+
+        fork_manager
+            .create_fork("f1", None, None, false)
+            .await
+            .unwrap();
+        let checkpoints = fork_manager.admin.list_checkpoints(None).await.unwrap();
+        assert!(
+            checkpoints.iter().any(|cp| cp
+                .name
+                .as_deref()
+                .is_some_and(|n| n.starts_with("fork-f1-"))),
+            "source checkpoint pinned at create"
+        );
+
+        fork_manager.delete_fork("f1").await.unwrap();
+
+        assert!(fork_manager.list_forks().await.unwrap().is_empty());
+        let remaining: Vec<_> = object_store
+            .list(Some(&Path::from("vol/forks/f1")))
+            .collect()
+            .await;
+        assert!(remaining.is_empty(), "pending fork's prefix is empty");
+        let checkpoints = fork_manager.admin.list_checkpoints(None).await.unwrap();
+        assert!(
+            !checkpoints.iter().any(|cp| cp
+                .name
+                .as_deref()
+                .is_some_and(|n| n.starts_with("fork-f1-"))),
+            "creation-owned source checkpoint released"
+        );
+
+        // The name is free again.
+        fork_manager
+            .create_fork("f1", None, None, false)
+            .await
+            .unwrap();
+        assert_eq!(fork_manager.list_forks().await.unwrap().len(), 1);
+    }
+
+    /// A pending fork cut from a user-named checkpoint must not take the
+    /// user's checkpoint down with it.
+    #[tokio::test]
+    async fn delete_pending_fork_keeps_a_user_owned_source_checkpoint() {
+        let (parent_fs, fork_manager, object_store, parent_path, parent_db) =
+            new_parent_volume().await;
+        let (checkpoint_manager, _) = managers(
+            parent_db.clone(),
+            parent_path.clone(),
+            Arc::clone(&object_store),
+            &parent_fs,
+        );
+        checkpoint_manager.create_checkpoint("mine").await.unwrap();
+
+        fork_manager
+            .create_fork("f1", Some("mine".to_string()), None, false)
+            .await
+            .unwrap();
+        fork_manager.delete_fork("f1").await.unwrap();
+
+        assert!(
+            checkpoint_manager
+                .get_checkpoint_info("mine")
+                .await
+                .unwrap()
+                .is_some(),
+            "user-owned source checkpoint survives"
+        );
+    }
+
+    /// `materialize_fork_if_pending` is a no-op for volumes without a marker
+    /// and idempotent once materialized.
+    #[tokio::test]
+    async fn materialize_fork_if_pending_noops_without_a_marker() {
+        let (_parent_fs, fork_manager, object_store, parent_path, _parent_db) =
+            new_parent_volume().await;
+        let block_transformer: Arc<dyn slatedb::BlockTransformer> =
+            ZeroFsBlockTransformer::try_new_arc(&TEST_KEY, CompressionConfig::default())
+                .expect("test key should be lockable");
+
+        // A non-fork volume has no marker.
+        assert!(
+            !materialize_fork_if_pending(
+                &object_store,
+                &parent_path,
+                Arc::clone(&block_transformer)
+            )
+            .await
+            .unwrap()
+        );
+
+        fork_manager
+            .create_fork("f1", None, None, false)
+            .await
+            .unwrap();
+        let fork_path = Path::from("vol/forks/f1");
+        assert!(
+            materialize_fork_if_pending(&object_store, &fork_path, Arc::clone(&block_transformer))
+                .await
+                .unwrap(),
+            "first call materializes"
+        );
+        assert!(
+            !materialize_fork_if_pending(&object_store, &fork_path, block_transformer)
+                .await
+                .unwrap(),
+            "already materialized: no-op"
+        );
+    }
+
+    /// In-process timing: lazy create does strictly less work than the
+    /// barriered create (no clone, no key copy, no fork database open).
+    #[tokio::test]
+    async fn lazy_create_is_cheaper_than_barrier_create() {
+        let (_parent_fs, fork_manager, _store, _path, _db) = new_parent_volume().await;
+
+        let start = std::time::Instant::now();
+        fork_manager
+            .create_fork("lazy", None, None, false)
+            .await
+            .unwrap();
+        let lazy = start.elapsed();
+
+        let start = std::time::Instant::now();
+        fork_manager
+            .create_fork("eager", None, None, true)
+            .await
+            .unwrap();
+        let eager = start.elapsed();
+
+        eprintln!("create_fork timing: lazy={lazy:?} barrier={eager:?}");
+        assert!(
+            lazy < eager,
+            "lazy create ({lazy:?}) skips the barrier create's ({eager:?}) clone and lineage write"
+        );
+    }
+    /// Regression: a first open must materialize the clone and inherited key
+    /// BEFORE the volume's encryption key is loaded; otherwise the open
+    /// generates a fresh wrong key and the fork writes SSTs the parent's key
+    /// cannot read (and cannot read the parent's SSTs).
+    #[tokio::test]
+    async fn storage_materialize_before_key_load_yields_the_parent_key() {
+        let (parent_fs, fork_manager, object_store, parent_path, _parent_db) =
+            new_parent_volume().await;
+        let creds = test_creds();
+        let auth = root_auth();
+
+        let (file_id, _) = parent_fs
+            .create(&creds, 0, b"hello.txt", &SetAttributes::default())
+            .await
+            .unwrap();
+        parent_fs
+            .write(&auth, file_id, 0, &Bytes::from_static(b"hello from parent"))
+            .await
+            .unwrap();
+        // Lazy branch points capture the durable manifest: flush first so the
+        // write is included (the barrier-free path's documented trade).
+        parent_fs.flush_coordinator.flush().await.unwrap();
+
+        fork_manager
+            .create_fork("l1", None, None, false)
+            .await
+            .unwrap();
+        let fork_path = Path::from("vol/forks/l1");
+
+        // The production order: materialize storage (clone + inherited key
+        // copy) BEFORE the encryption key is loaded.
+        assert!(
+            materialize_fork_storage_if_pending(&object_store, &fork_path)
+                .await
+                .unwrap()
+        );
+        let fork_key = key_management::load_wrapped_key_from_object_store(
+            &object_store,
+            &fork_path,
+        )
+        .await
+        .unwrap()
+        .expect("fork has the inherited wrapped key after storage materialization");
+        let parent_key = key_management::load_wrapped_key_from_object_store(
+            &object_store,
+            &parent_path,
+        )
+        .await
+        .unwrap()
+        .expect("parent has its wrapped key");
+        assert_eq!(
+            bincode::serialize(&fork_key).unwrap(),
+            bincode::serialize(&parent_key).unwrap(),
+            "inherited wrapped key must be the parent's, byte for byte"
+        );
+
+        // Full materialization via the production open hook, then decode.
+        let (fork_fs, _fork_db) = open_volume(Arc::clone(&object_store), fork_path.clone()).await;
+        let (data, _) = fork_fs.read_file(&auth, file_id, 0, 1024).await.unwrap();
+        assert_eq!(&data[..], b"hello from parent");
     }
 }

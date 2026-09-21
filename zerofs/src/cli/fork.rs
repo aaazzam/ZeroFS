@@ -8,6 +8,7 @@ pub async fn create_fork(
     name: &str,
     from_checkpoint: Option<String>,
     at: Option<String>,
+    barrier: bool,
 ) -> Result<()> {
     let at = at
         .map(|t| {
@@ -17,13 +18,18 @@ pub async fn create_fork(
         })
         .transpose()?;
     let client = connect_rpc_client(config_path).await?;
-    let fork = client.create_fork(name, from_checkpoint, at).await?;
+    let fork = client
+        .create_fork(name, from_checkpoint, at, barrier)
+        .await?;
 
     println!("✓ Fork created successfully!");
     println!("  Name: {}", fork.name);
     println!("  Fork db path: {}", fork.db_path);
     println!("  Parent db path: {}", fork.parent_db_path);
     println!("  Base epoch: {}", fork.base_epoch);
+    if !barrier {
+        println!("  State: pending (materializes at the fork's first open)");
+    }
     println!();
     println!("Serve the fork with a config whose [storage] url points at the fork db path, e.g.:");
     println!("  url = \"<backend>://<bucket>/{}/\"", fork.db_path);

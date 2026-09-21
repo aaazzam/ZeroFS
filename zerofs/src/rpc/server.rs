@@ -412,7 +412,7 @@ impl AdminService for AdminRpcServer {
 
         let info = self
             .fork_manager
-            .create_fork(&request.name, from_checkpoint, at)
+            .create_fork(&request.name, from_checkpoint, at, request.barrier)
             .await
             .map_err(|e| Status::internal(format!("Failed to create fork: {}", e)))?;
 
@@ -448,6 +448,96 @@ impl AdminService for AdminRpcServer {
             .map_err(|e| Status::internal(format!("Failed to delete fork: {}", e)))?;
 
         self.success_response(proto::DeleteForkResponse {})
+    }
+
+    async fn create_branch(
+        &self,
+        request: Request<proto::CreateBranchRequest>,
+    ) -> Result<Response<proto::CreateBranchResponse>, Status> {
+        let name = request.into_inner().name;
+
+        let id = self
+            .fs
+            .db
+            .create_branch(&name)
+            .await
+            .map_err(|e| Status::internal(format!("Failed to create branch: {}", e)))?;
+
+        self.success_response(proto::CreateBranchResponse {
+            branch: Some(proto::BranchInfo {
+                name,
+                id: id.0,
+                created_at: Some(prost_types::Timestamp::from(std::time::SystemTime::now())),
+            }),
+        })
+    }
+
+    async fn list_branches(
+        &self,
+        _request: Request<proto::ListBranchesRequest>,
+    ) -> Result<Response<proto::ListBranchesResponse>, Status> {
+        let branches = self
+            .fs
+            .db
+            .list_branches()
+            .await
+            .map_err(|e| Status::internal(format!("Failed to list branches: {}", e)))?;
+
+        self.success_response(proto::ListBranchesResponse {
+            branches: branches
+                .into_iter()
+                .map(|(name, record)| proto::BranchInfo {
+                    name,
+                    id: record.id,
+                    created_at: Some(prost_types::Timestamp {
+                        seconds: record.created_at as i64,
+                        nanos: 0,
+                    }),
+                })
+                .collect(),
+        })
+    }
+
+    async fn delete_branch(
+        &self,
+        request: Request<proto::DeleteBranchRequest>,
+    ) -> Result<Response<proto::DeleteBranchResponse>, Status> {
+        let name = request.into_inner().name;
+
+        // Resolve the id first: data deletion is keyed by branch id, and the
+        // registry row must go first so no new server can resolve the branch
+        // while its keys are being dropped.
+        let id = self
+            .fs
+            .db
+            .resolve_branch(&name)
+            .await
+            .map_err(|e| Status::internal(format!("Failed to resolve branch: {}", e)))?
+            .ok_or_else(|| Status::not_found(format!("Branch '{}' not found", name)))?;
+        if self.fs.db.branch() == id {
+            return Err(Status::failed_precondition(format!(
+                "refusing to delete branch '{name}': this server is serving it"
+            )));
+        }
+
+        if !self
+            .fs
+            .db
+            .delete_branch(&name)
+            .await
+            .map_err(|e| Status::internal(format!("Failed to delete branch: {}", e)))?
+        {
+            return Err(Status::not_found(format!("Branch '{}' not found", name)));
+        }
+        let rows = self
+            .fs
+            .db
+            .delete_branch_data(id)
+            .await
+            .map_err(|e| Status::internal(format!("Failed to delete branch data: {}", e)))?;
+        info!("DeleteBranch: dropped branch {name:?} (id {}) and {rows} rows", id.0);
+
+        self.success_response(proto::DeleteBranchResponse {})
     }
 
     async fn watch_file_access(
@@ -1015,6 +1105,45 @@ mod tests {
             .expect_err("revoked leader returned a successful stream item");
         assert_eq!(stream_error.code(), tonic::Code::Unavailable);
         assert!(gated_stream.next().await.is_none());
+
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn branch_create_list_delete_roundtrip() {
+        let (_fs, client, shutdown, _dir) = setup().await;
+
+        let branch = client.create_branch("feature-x").await.unwrap();
+        assert_eq!(branch.name, "feature-x");
+        assert_eq!(branch.id, 1, "first registered branch gets id 1");
+        assert!(branch.created_at.is_some());
+
+        // Duplicate and empty names are rejected.
+        assert!(client.create_branch("feature-x").await.is_err());
+        assert!(client.create_branch("").await.is_err());
+
+        let listed = client.list_branches().await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].name, "feature-x");
+        assert_eq!(listed[0].id, 1);
+
+        let second = client.create_branch("feature-y").await.unwrap();
+        assert_eq!(second.id, 2, "ids are allocated in order");
+        assert_eq!(client.list_branches().await.unwrap().len(), 2);
+
+        client.delete_branch("feature-x").await.unwrap();
+        let remaining = client.list_branches().await.unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].name, "feature-y");
+
+        // Deleting a missing branch fails; a re-created branch gets a fresh id.
+        assert!(client.delete_branch("feature-x").await.is_err());
+        let recreated = client.create_branch("feature-x").await.unwrap();
+        assert_eq!(recreated.id, 3, "ids are never reused");
+
+        client.delete_branch("feature-y").await.unwrap();
+        client.delete_branch("feature-x").await.unwrap();
+        assert!(client.list_branches().await.unwrap().is_empty());
 
         shutdown.cancel();
     }

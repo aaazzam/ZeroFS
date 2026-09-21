@@ -13,14 +13,17 @@
 //! (see [`crate::fs::key_codec`]):
 //!
 //! - **Lineage** — a single `KeyPrefix::ForkLineage` record in the fork's OWN
-//!   database. Written at fork creation (after the clone, by opening the
-//!   freshly cloned database once), read back on every startup of the fork to
+//!   database. Written when the fork materializes (eager forks: at creation;
+//!   lazy forks: at the fork's first open — see [`crate::fork_manager`] for
+//!   the two-phase lifecycle), read back on every startup of the fork to
 //!   build the segment path router. A non-fork volume has no record.
 //! - **Registry** — a `KeyPrefix::ForkRegistry/<fork name>` record per fork in
 //!   the PARENT's database, so `list_forks` is a prefix scan of the parent's
-//!   own LSM. It is written strictly after the lineage record: a crash can
-//!   leave a fork whose lineage exists but no registry entry (an unlisted
-//!   fork), never a registry entry pointing at a fork without lineage.
+//!   own LSM. It is written strictly after the lineage record (eager) or the
+//!   pending-materialization marker (lazy): a crash can leave a fork whose
+//!   lineage/marker exists but no registry entry (an unlisted fork), never a
+//!   registry entry pointing at a fork whose materialization state is
+//!   missing.
 //!
 //! Both values are a version byte followed by JSON, so a future format change
 //! bumps the version and migrates reads.

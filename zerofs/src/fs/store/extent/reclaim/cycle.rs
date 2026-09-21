@@ -231,10 +231,19 @@ async fn scan_counters(
     repack_min_dead_percent: u64,
 ) -> Result<CounterScan, FsError> {
     let (sc_start, sc_end) = store.key_codec.segcount_prefix_range();
-    let mut stream = store.db.scan_durable(sc_start..sc_end).await.map_err(|e| {
-        error!("segment-reclamation counter scan failed: {}", e);
-        FsError::IoError
-    })?;
+    // Raw, never the branch-merged view: a branch's reclaim manages exactly
+    // its own segcount scope (its prefix range brackets `[kind || branch,
+    // kind || branch + 1)`); the merged view would additionally surface the
+    // parent's counters re-keyed, and the parent's lifecycle is not the
+    // branch's to drive. On a root handle raw and merged are identical.
+    let mut stream = store
+        .db
+        .scan_durable_raw(sc_start..sc_end)
+        .await
+        .map_err(|e| {
+            error!("segment-reclamation counter scan failed: {}", e);
+            FsError::IoError
+        })?;
     let mut scan = CounterScan {
         scanned: 0,
         total_live: 0,
@@ -540,9 +549,17 @@ impl OrphanSweep {
     }
 }
 
-/// Sweep objects with no `segcount` key. Counter credit commits atomically with
-/// the first FrameLoc, so an absent counter means no extent references the
-/// object. This is the only segment-namespace LIST.
+/// Sweep objects with no `segcount` key IN ANY LIVE SCOPE. Counter credit
+/// commits atomically with the first FrameLoc, so an absent counter means no
+/// extent references the object. This is the only segment-namespace LIST.
+///
+/// Branches share the `segments/` object namespace with the parent, so the
+/// liveness test is a census of every scope's counters (root plus every
+/// basin branch's `[SEGCOUNT || branch]` slice — one raw scan of the whole
+/// kind), not a probe of the local scope: a segment written by branch B is
+/// reclaimable only once no live branch (or the parent) holds a counter for
+/// it. A deleted branch's counters disappear with its key-range drop, so its
+/// orphaned objects become reclaimable here.
 ///
 /// Candidates must be sealed before the cutoff and pass directory verification.
 /// The reclaim lock excludes concurrent repacks whose output PUT has not yet
@@ -557,6 +574,7 @@ pub async fn sweep_orphans(
         return Ok(OrphanSweep::Interrupted { deleted: 0 });
     }
     let cutoff = durable_reclaim_cutoff(store).await?;
+    let live_counters = segcount_census(store).await?;
     // Verify candidates as they arrive, traversing the entire listing even
     // when individual objects cannot be verified or deleted.
     let mut deleted = 0;
@@ -573,14 +591,7 @@ pub async fn sweep_orphans(
         if !sealed_before(&segid, cutoff.epoch, cutoff.counter) {
             continue;
         }
-        let key = store.key_codec.segcount_key(segid.epoch, segid.counter);
-        if store
-            .db
-            .get_bytes(&key)
-            .await
-            .map_err(|_| FsError::IoError)?
-            .is_some()
-        {
+        if live_counters.contains(&(segid.epoch, segid.counter)) {
             continue;
         }
         if cancel.is_cancelled() {
@@ -623,6 +634,30 @@ pub async fn sweep_orphans(
     }
     info!("orphan sweep: scanned {scanned} segment objects, reclaimed {deleted} orphan(s)");
     Ok(OrphanSweep::Completed { deleted })
+}
+
+/// Every `(epoch, counter)` with a segcount row in ANY branch scope: the
+/// parent's rows and every basin branch's `[SEGCOUNT || branch]` slice, read
+/// as one raw scan of the whole kind (branch ids sort as key payload inside
+/// it, so the root codec's prefix range covers all scopes). The sweep treats
+/// an object as live while ANY scope holds its counter — a branch's objects
+/// must survive the parent's sweep, and vice versa. Rows of a deleted branch
+/// are gone with its key-range drop, so they correctly stop protecting its
+/// orphaned objects.
+async fn segcount_census(store: &ExtentStore) -> Result<HashSet<(u64, u64)>, FsError> {
+    let (start, end) = KeyCodec::new().segcount_prefix_range();
+    let mut stream = store.db.scan_raw(start..end).await.map_err(|e| {
+        error!("orphan sweep: segcount census scan failed: {e}");
+        FsError::IoError
+    })?;
+    let mut live = HashSet::new();
+    while let Some(result) = stream.next().await {
+        let (key, _) = result.map_err(|_| FsError::IoError)?;
+        if let Some(id) = KeyCodec::parse_any_segcount_key(&key) {
+            live.insert(id);
+        }
+    }
+    Ok(live)
 }
 
 /// Recover only the startup delay from the last completed sweep. A future

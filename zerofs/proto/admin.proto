@@ -19,6 +19,12 @@ service AdminService {
 
     rpc DeleteFork(DeleteForkRequest) returns (DeleteForkResponse);
 
+    rpc CreateBranch(CreateBranchRequest) returns (CreateBranchResponse);
+
+    rpc ListBranches(ListBranchesRequest) returns (ListBranchesResponse);
+
+    rpc DeleteBranch(DeleteBranchRequest) returns (DeleteBranchResponse);
+
     rpc WatchFileAccess(WatchFileAccessRequest) returns (stream FileAccessEvent);
 
     rpc WatchObjectAccess(WatchObjectAccessRequest) returns (stream ObjectAccessEvent);
@@ -110,6 +116,11 @@ message CreateForkRequest {
     // Point-in-time fork: RFC 3339 timestamp; forks the volume as of the last
     // manifest flushed before it. Overrides from_checkpoint when set.
     string at = 3;
+    // Eager creation: seal+flush barrier at the branch point and full
+    // materialization before create returns (~1s). Default (false) is lazy:
+    // registration only (~50ms); the fork materializes at its first open,
+    // and the branch point can lag HEAD by up to the flush interval.
+    bool barrier = 4;
 }
 
 message CreateForkResponse {
@@ -127,6 +138,34 @@ message DeleteForkRequest {
 }
 
 message DeleteForkResponse {}
+
+message BranchInfo {
+    string name = 1;
+    // Key-space id embedded in every branch-scoped key the branch writes.
+    // Never reused, even after the branch is deleted.
+    uint32 id = 2;
+    google.protobuf.Timestamp created_at = 3;
+}
+
+message CreateBranchRequest {
+    string name = 1;
+}
+
+message CreateBranchResponse {
+    BranchInfo branch = 1;
+}
+
+message ListBranchesRequest {}
+
+message ListBranchesResponse {
+    repeated BranchInfo branches = 1;
+}
+
+message DeleteBranchRequest {
+    string name = 1;
+}
+
+message DeleteBranchResponse {}
 
 message WatchFileAccessRequest {}
 

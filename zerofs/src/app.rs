@@ -50,8 +50,10 @@ pub(crate) async fn run() -> Result<()> {
             config,
             read_only,
             checkpoint,
+            branch,
         } => {
-            if let Err(e) = crate::cli::server::run_server(config, read_only, checkpoint).await {
+            if let Err(e) = crate::cli::server::run_server(config, read_only, checkpoint, branch).await
+            {
                 eprintln!("✗ Error: {e:#}");
                 std::process::exit(1);
             }
@@ -81,14 +83,26 @@ pub(crate) async fn run() -> Result<()> {
                 name,
                 from_checkpoint,
                 at,
+                barrier,
             } => {
-                crate::cli::fork::create_fork(&config, &name, from_checkpoint, at).await?;
+                crate::cli::fork::create_fork(&config, &name, from_checkpoint, at, barrier).await?;
             }
             crate::cli::ForkCommands::List { config } => {
                 crate::cli::fork::list_forks(&config).await?;
             }
             crate::cli::ForkCommands::Delete { config, name } => {
                 crate::cli::fork::delete_fork(&config, &name).await?;
+            }
+        },
+        crate::cli::Commands::Branch { subcommand } => match subcommand {
+            crate::cli::BranchCommands::Create { config, name } => {
+                crate::cli::branch::create_branch(&config, &name).await?;
+            }
+            crate::cli::BranchCommands::List { config } => {
+                crate::cli::branch::list_branches(&config).await?;
+            }
+            crate::cli::BranchCommands::Delete { config, name } => {
+                crate::cli::branch::delete_branch(&config, &name).await?;
             }
         },
         crate::cli::Commands::Fatrace { config } => {

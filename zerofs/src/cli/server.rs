@@ -819,6 +819,7 @@ pub async fn run_server(
     config_path: PathBuf,
     read_only: bool,
     checkpoint_name: Option<String>,
+    branch_name: Option<String>,
 ) -> Result<()> {
     use tracing_subscriber::EnvFilter;
 
@@ -877,7 +878,8 @@ pub async fn run_server(
 
     crate::telemetry::send_startup_event(&settings);
 
-    let init_result = crate::cli::init::initialize_filesystem(&settings, password, db_mode).await?;
+    let init_result =
+        crate::cli::init::initialize_filesystem(&settings, password, db_mode, branch_name).await?;
     let fs = init_result.fs;
     let authority = init_result.authority;
     let leadership_deposed = authority

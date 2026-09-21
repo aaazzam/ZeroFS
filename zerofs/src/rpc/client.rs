@@ -157,11 +157,13 @@ impl RpcClient {
         name: &str,
         from_checkpoint: Option<String>,
         at: Option<chrono::DateTime<chrono::Utc>>,
+        barrier: bool,
     ) -> Result<proto::ForkInfo> {
         let request = proto::CreateForkRequest {
             name: name.to_string(),
             from_checkpoint: from_checkpoint.unwrap_or_default(),
             at: at.map(|t| t.to_rfc3339()).unwrap_or_default(),
+            barrier,
         };
 
         let response = self
@@ -199,6 +201,52 @@ impl RpcClient {
         self.client
             .clone()
             .delete_fork(request)
+            .await
+            .map_err(|s| anyhow!("{}", s.message()))?;
+
+        Ok(())
+    }
+
+    pub async fn create_branch(&self, name: &str) -> Result<proto::BranchInfo> {
+        let request = proto::CreateBranchRequest {
+            name: name.to_string(),
+        };
+
+        let response = self
+            .client
+            .clone()
+            .create_branch(request)
+            .await
+            .map_err(|s| anyhow!("{}", s.message()))?
+            .into_inner();
+
+        response
+            .branch
+            .ok_or_else(|| anyhow!("Empty response from server"))
+    }
+
+    pub async fn list_branches(&self) -> Result<Vec<proto::BranchInfo>> {
+        let request = proto::ListBranchesRequest {};
+
+        let response = self
+            .client
+            .clone()
+            .list_branches(request)
+            .await
+            .map_err(|s| anyhow!("{}", s.message()))?
+            .into_inner();
+
+        Ok(response.branches)
+    }
+
+    pub async fn delete_branch(&self, name: &str) -> Result<()> {
+        let request = proto::DeleteBranchRequest {
+            name: name.to_string(),
+        };
+
+        self.client
+            .clone()
+            .delete_branch(request)
             .await
             .map_err(|s| anyhow!("{}", s.message()))?;
 

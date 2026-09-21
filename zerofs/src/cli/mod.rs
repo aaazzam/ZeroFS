@@ -4,6 +4,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
 
+pub mod branch;
 pub mod checkpoint;
 pub mod debug;
 pub mod fatrace;
@@ -41,6 +42,12 @@ pub enum Commands {
         /// Open from a specific checkpoint by name (read-only mode)
         #[arg(long, conflicts_with = "read_only")]
         checkpoint: Option<String>,
+        /// Serve this basin branch of the volume instead of the root. The
+        /// branch must already exist (create it with `zerofs branch create`
+        /// against the running parent server). Not supported together with
+        /// [replication].
+        #[arg(long)]
+        branch: Option<String>,
     },
     /// Change the encryption password
     ///
@@ -67,6 +74,11 @@ pub enum Commands {
     Fork {
         #[command(subcommand)]
         subcommand: ForkCommands,
+    },
+    /// Basin branch commands: O(1) branch namespaces inside this volume
+    Branch {
+        #[command(subcommand)]
+        subcommand: BranchCommands,
     },
     /// Trace file system operations in real-time
     Fatrace {
@@ -176,6 +188,29 @@ pub enum CheckpointCommands {
 }
 
 #[derive(Subcommand)]
+pub enum BranchCommands {
+    /// Create a basin branch of this volume (O(1); no data is copied)
+    Create {
+        #[arg(short, long)]
+        config: PathBuf,
+        /// Name for the branch (must be unique among this volume's branches)
+        name: String,
+    },
+    /// Delete a branch, its registry entry, and all of its data
+    Delete {
+        #[arg(short, long)]
+        config: PathBuf,
+        /// Branch name to delete
+        name: String,
+    },
+    /// List this volume's basin branches
+    List {
+        #[arg(short, long)]
+        config: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
 pub enum ForkCommands {
     /// Create a writable fork of this volume
     Create {
@@ -190,6 +225,12 @@ pub enum ForkCommands {
         /// flushed before this RFC 3339 timestamp
         #[arg(long)]
         at: Option<String>,
+        /// Seal+flush barrier at the branch point and full materialization
+        /// before create returns (~1s). Default is lazy creation (~50ms):
+        /// the fork materializes at its first open, and the branch point can
+        /// lag HEAD by up to the flush interval
+        #[arg(long)]
+        barrier: bool,
     },
     /// Delete a fork, releasing its pin on the parent's reclamation
     Delete {

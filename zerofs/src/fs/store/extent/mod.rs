@@ -197,9 +197,13 @@ impl ExtentStore {
 
     /// Sum segment counters to seed footprint gauges at open and verify
     /// incremental updates in tests.
+    ///
+    /// Raw, own-scope scan: a branch's gauges track only the branch's
+    /// counters (the merged view would fold the parent's rows in). On a root
+    /// handle raw and merged scans are identical.
     pub async fn sample_footprint(&self) -> Result<SegmentFootprint, FsError> {
         let (sc_start, sc_end) = self.key_codec.segcount_prefix_range();
-        let mut stream = self.db.scan(sc_start..sc_end).await.map_err(|e| {
+        let mut stream = self.db.scan_raw(sc_start..sc_end).await.map_err(|e| {
             error!("segment footprint scan failed: {}", e);
             FsError::IoError
         })?;
